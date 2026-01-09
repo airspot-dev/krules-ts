@@ -1,0 +1,82 @@
+{
+  "name": "krules",
+  "version": "0.1.0",
+  "description": "Event-driven, reactive state management framework for TypeScript and Bun",
+  "license": "Apache-2.0",
+  "author": "Airspot",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/airspot-dev/krules-ts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/airspot-dev/krules-ts/issues"
+  },
+  "homepage": "https://github.com/airspot-dev/krules-ts#readme",
+  "keywords": [
+    "krules",
+    "event-driven",
+    "reactive",
+    "state-management",
+    "bun",
+    "typescript",
+    "redis",
+    "postgresql"
+  ],
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    },
+    "./events": {
+      "import": "./src/events/index.ts",
+      "types": "./src/events/index.ts"
+    },
+    "./storage": {
+      "import": "./src/storage/index.ts",
+      "types": "./src/storage/index.ts"
+    },
+    "./storage/redis": {
+      "import": "./src/storage/redis.ts",
+      "types": "./src/storage/redis.ts"
+    },
+    "./storage/postgres": {
+      "import": "./src/storage/postgres.ts",
+      "types": "./src/storage/postgres.ts"
+    },
+    "./storage/bun-redis": {
+      "import": "./src/storage/bun-redis.ts",
+      "types": "./src/storage/bun-redis.ts"
+    },
+    "./storage/bun-postgres": {
+      "import": "./src/storage/bun-postgres.ts",
+      "types": "./src/storage/bun-postgres.ts"
+    }
+  },
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "awilix": "^10.0.2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.4.0"
+  },
+  "peerDependencies": {
+    "ioredis": "^5.4.1",
+    "postgres": "^3.4.0"
+  },
+  "peerDependenciesMeta": {
+    "ioredis": {
+      "optional": true
+    },
+    "postgres": {
+      "optional": true
+    }
+  }
+}
