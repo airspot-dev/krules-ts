@@ -13,25 +13,19 @@
 
 ## Installation
 
-**Bun** (recommended):
 ```bash
-bun add @airspot/krules
+bun add krules
 ```
 
-**Deno**:
+Or with npm:
 ```bash
-deno add jsr:@airspot/krules
-```
-
-**Node.js / npm**:
-```bash
-npx jsr add @airspot/krules
+npm install krules
 ```
 
 ## Quick Start (In-Memory)
 
 ```typescript
-import { createKRulesContainer, SubjectPropertyChanged } from '@airspot/krules'
+import { createKRulesContainer, SubjectPropertyChanged } from 'krules'
 
 // 1. Create Container (defaults to MemoryStorage)
 const container = createKRulesContainer()
@@ -178,9 +172,9 @@ on(SubjectDeleted)
 The real power of `krules` comes from mixing storage backends transparently.
 
 ```typescript
-import { createKRulesContainer } from '@airspot/krules'
-import { createRedisStorage } from '@airspot/krules/storage/redis'
-import { createPostgresStorage } from '@airspot/krules/storage/postgres'
+import { createKRulesContainer } from 'krules'
+import { createRedisStorage } from 'krules/storage/redis'
+import { createPostgresStorage } from 'krules/storage/postgres'
 import Redis from 'ioredis'
 import postgres from 'postgres'
 
@@ -303,7 +297,7 @@ container.eventBus.unregisterAll()
 `krules` includes specialized storage adapters that leverage **Bun's native clients** for Redis and PostgreSQL, bypassing Node.js compatibility layers for maximum throughput.
 
 ```typescript
-import { createBunRedisStorage } from '@airspot/krules/storage/bun-redis'
+import { createBunRedisStorage } from 'krules/storage/bun-redis'
 // Uses Bun's built-in RedisClient (zero dependencies)
 const bunRedisFactory = createBunRedisStorage({ url: 'redis://localhost:6379' })
 ```
