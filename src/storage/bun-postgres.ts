@@ -102,7 +102,6 @@ export class BunPostgresStorage implements Storage {
 
   private parseProperties(raw: unknown): Record<string, unknown> {
     if (!raw) return {}
-    if (typeof raw === 'string') return JSON.parse(raw)
     return raw as Record<string, unknown>
   }
 
@@ -159,9 +158,9 @@ export class BunPostgresStorage implements Storage {
       // Upsert
       await tx.unsafe(
         `INSERT INTO ${this.fullTable} (name, properties)
-         VALUES ($1, $2::jsonb)
+         VALUES ($1, $2::text::jsonb)
          ON CONFLICT (name) DO UPDATE
-         SET properties = $2::jsonb, updated_at = NOW()`,
+         SET properties = $2::text::jsonb, updated_at = NOW()`,
         [this.subjectName, JSON.stringify(newProperties)]
       )
 
@@ -190,9 +189,9 @@ export class BunPostgresStorage implements Storage {
       // Upsert
       await tx.unsafe(
         `INSERT INTO ${this.fullTable} (name, properties)
-         VALUES ($1, $2::jsonb)
+         VALUES ($1, $2::text::jsonb)
          ON CONFLICT (name) DO UPDATE
-         SET properties = $2::jsonb, updated_at = NOW()`,
+         SET properties = $2::text::jsonb, updated_at = NOW()`,
         [this.subjectName, JSON.stringify(newProperties)]
       )
 
@@ -216,7 +215,7 @@ export class BunPostgresStorage implements Storage {
 
       // Update
       await tx.unsafe(
-        `UPDATE ${this.fullTable} SET properties = $1::jsonb, updated_at = NOW() WHERE name = $2`,
+        `UPDATE ${this.fullTable} SET properties = $1::text::jsonb, updated_at = NOW() WHERE name = $2`,
         [JSON.stringify(newProperties), this.subjectName]
       )
 
@@ -283,9 +282,9 @@ export class BunPostgresStorage implements Storage {
       // Upsert
       await tx.unsafe(
         `INSERT INTO ${this.fullTable} (name, properties)
-         VALUES ($1, $2::jsonb)
+         VALUES ($1, $2::text::jsonb)
          ON CONFLICT (name) DO UPDATE
-         SET properties = $2::jsonb, updated_at = NOW()`,
+         SET properties = $2::text::jsonb, updated_at = NOW()`,
         [this.subjectName, JSON.stringify(newProperties)]
       )
     })
