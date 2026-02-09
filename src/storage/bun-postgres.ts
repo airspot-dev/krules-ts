@@ -10,6 +10,7 @@
  * - Auto-prepared statements
  * - Connection pooling built-in
  * - JSONB for flexible property storage
+ * - Custom column mapping for pre-existing tables
  *
  * For advanced patterns (generated columns, indexing, queries),
  * see: postgres.md in this directory.
@@ -23,6 +24,15 @@
  * })
  *
  * const container = createKRulesContainer({ storageFactory })
+ *
+ * @example
+ * // Attach to an existing table with custom column names
+ * const storageFactory = await createBunPostgresStorage({
+ *   url: 'postgres://localhost/mydb',
+ *   table: 'adk_sessions',
+ *   nameColumn: 'session_id',
+ *   propertiesColumn: 'state',
+ * })
  */
 
 import type { Storage, StorageChanges, SetResult, DeleteResult, StorageFactory } from './types'
@@ -45,41 +55,96 @@ export interface BunPostgresStorageOptions {
   table?: string
   /** Schema name (default: 'public') */
   schema?: string
+  /** Column name for the subject identifier (default: 'name') */
+  nameColumn?: string
+  /** Column name for the JSONB properties (default: 'properties') */
+  propertiesColumn?: string
+}
+
+/** Resolved column configuration from schema inspection */
+interface ResolvedColumnConfig {
+  hasUpdatedAt: boolean
 }
 
 /** Track initialized tables to avoid repeated schema creation */
-const initializedTables = new Set<string>()
+const initializedTables = new Map<string, ResolvedColumnConfig>()
 
 /**
- * Ensure the subjects table exists.
- * Called once per table name.
+ * Ensure the subjects table and required columns exist.
+ * - If the table doesn't exist, creates it with all columns (including created_at/updated_at).
+ * - If the table exists, checks for nameCol/propsCol and adds them if missing.
+ *   created_at/updated_at are NOT added to pre-existing tables.
  */
-async function ensureSchema(sql: BunSQL, schema: string, table: string): Promise<void> {
+async function ensureSchema(
+  sql: BunSQL,
+  schema: string,
+  table: string,
+  nameCol: string,
+  propsCol: string
+): Promise<ResolvedColumnConfig> {
   const fullTable = `"${schema}"."${table}"`
   const cacheKey = `${schema}.${table}`
 
-  if (initializedTables.has(cacheKey)) {
-    return
-  }
+  const cached = initializedTables.get(cacheKey)
+  if (cached) return cached
 
-  // Use unsafe for DDL with dynamic table names
   const client = sql as any
 
-  await client.unsafe(`
-    CREATE TABLE IF NOT EXISTS ${fullTable} (
-      name VARCHAR(512) PRIMARY KEY,
-      properties JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `)
+  // Check if table exists
+  const tableExistsResult = await client.unsafe(
+    `SELECT EXISTS (
+      SELECT 1 FROM information_schema.tables
+      WHERE table_schema = $1 AND table_name = $2
+    ) as exists`,
+    [schema, table]
+  )
 
-  await client.unsafe(`
-    CREATE INDEX IF NOT EXISTS "idx_${table}_properties"
-    ON ${fullTable} USING GIN (properties)
-  `)
+  const tableExists = tableExistsResult[0]?.exists ?? false
 
-  initializedTables.add(cacheKey)
+  if (!tableExists) {
+    // Create new table with all columns
+    await client.unsafe(`
+      CREATE TABLE ${fullTable} (
+        "${nameCol}" VARCHAR(512) PRIMARY KEY,
+        "${propsCol}" JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `)
+
+    await client.unsafe(`
+      CREATE INDEX IF NOT EXISTS "idx_${table}_${propsCol}"
+      ON ${fullTable} USING GIN ("${propsCol}")
+    `)
+
+    const config: ResolvedColumnConfig = { hasUpdatedAt: true }
+    initializedTables.set(cacheKey, config)
+    return config
+  }
+
+  // Table exists - check for required columns
+  const columns = await client.unsafe(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_schema = $1 AND table_name = $2`,
+    [schema, table]
+  )
+  const existingColumns = new Set(columns.map((c: any) => c.column_name))
+
+  if (!existingColumns.has(nameCol)) {
+    await client.unsafe(`ALTER TABLE ${fullTable} ADD COLUMN "${nameCol}" VARCHAR(512)`)
+  }
+
+  if (!existingColumns.has(propsCol)) {
+    await client.unsafe(`ALTER TABLE ${fullTable} ADD COLUMN "${propsCol}" JSONB NOT NULL DEFAULT '{}'::jsonb`)
+    await client.unsafe(`
+      CREATE INDEX IF NOT EXISTS "idx_${table}_${propsCol}"
+      ON ${fullTable} USING GIN ("${propsCol}")
+    `)
+  }
+
+  const config: ResolvedColumnConfig = { hasUpdatedAt: existingColumns.has('updated_at') }
+  initializedTables.set(cacheKey, config)
+  return config
 }
 
 /**
@@ -89,25 +154,27 @@ async function ensureSchema(sql: BunSQL, schema: string, table: string): Promise
 export class BunPostgresStorage implements Storage {
   private readonly sql: BunSQL
   private readonly fullTable: string
+  private readonly nameCol: string
+  private readonly propsCol: string
+  private readonly hasUpdatedAt: boolean
 
   constructor(
     public readonly subjectName: string,
-    options: BunPostgresStorageOptions & { sql: BunSQL }
+    options: BunPostgresStorageOptions & { sql: BunSQL },
+    columnConfig: ResolvedColumnConfig
   ) {
     this.sql = options.sql
     const schema = options.schema ?? 'public'
     const table = options.table ?? 'krules_subjects'
     this.fullTable = `"${schema}"."${table}"`
+    this.nameCol = options.nameColumn ?? 'name'
+    this.propsCol = options.propertiesColumn ?? 'properties'
+    this.hasUpdatedAt = columnConfig.hasUpdatedAt
   }
 
   private parseProperties(raw: unknown): Record<string, unknown> {
     if (!raw) return {}
     return raw as Record<string, unknown>
-  }
-
-  // Helper to execute raw SQL with table name
-  private async query<T>(queryFn: (sql: BunSQL, table: string, name: string) => Promise<T>): Promise<T> {
-    return queryFn(this.sql, this.fullTable, this.subjectName)
   }
 
   isPersistent(): boolean {
@@ -118,14 +185,18 @@ export class BunPostgresStorage implements Storage {
     return true
   }
 
+  /** Returns `, updated_at = NOW()` if the column exists, empty string otherwise */
+  private get updatedAtClause(): string {
+    return this.hasUpdatedAt ? ', updated_at = NOW()' : ''
+  }
+
   // ============================================
   // Immediate Operations
   // ============================================
 
   async get(property: string): Promise<unknown | undefined> {
-    // Use unsafe for dynamic table name (safe: table name comes from our config)
     const rows = await (this.sql as any).unsafe(
-      `SELECT properties FROM ${this.fullTable} WHERE name = $1`,
+      `SELECT "${this.propsCol}" as properties FROM ${this.fullTable} WHERE "${this.nameCol}" = $1`,
       [this.subjectName]
     )
 
@@ -145,7 +216,7 @@ export class BunPostgresStorage implements Storage {
     return this.sql.begin(async (tx: any) => {
       // Get current properties
       const oldRows = await tx.unsafe(
-        `SELECT properties FROM ${this.fullTable} WHERE name = $1 FOR UPDATE`,
+        `SELECT "${this.propsCol}" as properties FROM ${this.fullTable} WHERE "${this.nameCol}" = $1 FOR UPDATE`,
         [this.subjectName]
       )
 
@@ -157,10 +228,10 @@ export class BunPostgresStorage implements Storage {
 
       // Upsert
       await tx.unsafe(
-        `INSERT INTO ${this.fullTable} (name, properties)
+        `INSERT INTO ${this.fullTable} ("${this.nameCol}", "${this.propsCol}")
          VALUES ($1, $2::text::jsonb)
-         ON CONFLICT (name) DO UPDATE
-         SET properties = $2::text::jsonb, updated_at = NOW()`,
+         ON CONFLICT ("${this.nameCol}") DO UPDATE
+         SET "${this.propsCol}" = $2::text::jsonb${this.updatedAtClause}`,
         [this.subjectName, JSON.stringify(newProperties)]
       )
 
@@ -175,7 +246,7 @@ export class BunPostgresStorage implements Storage {
     return this.sql.begin(async (tx: any) => {
       // Lock row for update
       const oldRows = await tx.unsafe(
-        `SELECT properties FROM ${this.fullTable} WHERE name = $1 FOR UPDATE`,
+        `SELECT "${this.propsCol}" as properties FROM ${this.fullTable} WHERE "${this.nameCol}" = $1 FOR UPDATE`,
         [this.subjectName]
       )
 
@@ -188,10 +259,10 @@ export class BunPostgresStorage implements Storage {
 
       // Upsert
       await tx.unsafe(
-        `INSERT INTO ${this.fullTable} (name, properties)
+        `INSERT INTO ${this.fullTable} ("${this.nameCol}", "${this.propsCol}")
          VALUES ($1, $2::text::jsonb)
-         ON CONFLICT (name) DO UPDATE
-         SET properties = $2::text::jsonb, updated_at = NOW()`,
+         ON CONFLICT ("${this.nameCol}") DO UPDATE
+         SET "${this.propsCol}" = $2::text::jsonb${this.updatedAtClause}`,
         [this.subjectName, JSON.stringify(newProperties)]
       )
 
@@ -203,7 +274,7 @@ export class BunPostgresStorage implements Storage {
     return this.sql.begin(async (tx: any) => {
       // Get current properties
       const oldRows = await tx.unsafe(
-        `SELECT properties FROM ${this.fullTable} WHERE name = $1 FOR UPDATE`,
+        `SELECT "${this.propsCol}" as properties FROM ${this.fullTable} WHERE "${this.nameCol}" = $1 FOR UPDATE`,
         [this.subjectName]
       )
 
@@ -215,7 +286,7 @@ export class BunPostgresStorage implements Storage {
 
       // Update
       await tx.unsafe(
-        `UPDATE ${this.fullTable} SET properties = $1::text::jsonb, updated_at = NOW() WHERE name = $2`,
+        `UPDATE ${this.fullTable} SET "${this.propsCol}" = $1::text::jsonb${this.updatedAtClause} WHERE "${this.nameCol}" = $2`,
         [JSON.stringify(newProperties), this.subjectName]
       )
 
@@ -225,7 +296,7 @@ export class BunPostgresStorage implements Storage {
 
   async has(property: string): Promise<boolean> {
     const rows = await (this.sql as any).unsafe(
-      `SELECT properties ? $1 as exists FROM ${this.fullTable} WHERE name = $2`,
+      `SELECT "${this.propsCol}" ? $1 as exists FROM ${this.fullTable} WHERE "${this.nameCol}" = $2`,
       [property, this.subjectName]
     )
     return rows[0]?.exists ?? false
@@ -233,7 +304,7 @@ export class BunPostgresStorage implements Storage {
 
   async keys(): Promise<string[]> {
     const rows = await (this.sql as any).unsafe(
-      `SELECT ARRAY(SELECT jsonb_object_keys(properties)) as keys FROM ${this.fullTable} WHERE name = $1`,
+      `SELECT ARRAY(SELECT jsonb_object_keys("${this.propsCol}")) as keys FROM ${this.fullTable} WHERE "${this.nameCol}" = $1`,
       [this.subjectName]
     )
     return rows[0]?.keys ?? []
@@ -245,7 +316,7 @@ export class BunPostgresStorage implements Storage {
 
   async load(): Promise<Record<string, unknown>> {
     const rows = await (this.sql as any).unsafe(
-      `SELECT properties FROM ${this.fullTable} WHERE name = $1`,
+      `SELECT "${this.propsCol}" as properties FROM ${this.fullTable} WHERE "${this.nameCol}" = $1`,
       [this.subjectName]
     )
     return this.parseProperties(rows[0]?.properties)
@@ -259,7 +330,7 @@ export class BunPostgresStorage implements Storage {
     await this.sql.begin(async (tx: any) => {
       // Get current properties
       const oldRows = await tx.unsafe(
-        `SELECT properties FROM ${this.fullTable} WHERE name = $1 FOR UPDATE`,
+        `SELECT "${this.propsCol}" as properties FROM ${this.fullTable} WHERE "${this.nameCol}" = $1 FOR UPDATE`,
         [this.subjectName]
       )
 
@@ -281,10 +352,10 @@ export class BunPostgresStorage implements Storage {
 
       // Upsert
       await tx.unsafe(
-        `INSERT INTO ${this.fullTable} (name, properties)
+        `INSERT INTO ${this.fullTable} ("${this.nameCol}", "${this.propsCol}")
          VALUES ($1, $2::text::jsonb)
-         ON CONFLICT (name) DO UPDATE
-         SET properties = $2::text::jsonb, updated_at = NOW()`,
+         ON CONFLICT ("${this.nameCol}") DO UPDATE
+         SET "${this.propsCol}" = $2::text::jsonb${this.updatedAtClause}`,
         [this.subjectName, JSON.stringify(newProperties)]
       )
     })
@@ -296,7 +367,7 @@ export class BunPostgresStorage implements Storage {
 
   async flush(): Promise<void> {
     await (this.sql as any).unsafe(
-      `DELETE FROM ${this.fullTable} WHERE name = $1`,
+      `DELETE FROM ${this.fullTable} WHERE "${this.nameCol}" = $1`,
       [this.subjectName]
     )
   }
@@ -304,7 +375,8 @@ export class BunPostgresStorage implements Storage {
 
 /**
  * Create a Bun-native PostgreSQL storage factory.
- * Automatically creates the schema/table on first use.
+ * Automatically creates the schema/table on first use,
+ * or attaches to an existing table with custom column names.
  *
  * @param options - PostgreSQL URL and table configuration
  * @returns Storage factory function
@@ -322,12 +394,25 @@ export class BunPostgresStorage implements Storage {
  *
  * const user = container.subject('user:123')
  * await user.set('name', 'John')
+ *
+ * @example
+ * // Attach to pre-existing table
+ * const container = createKRulesContainer({
+ *   storageFactory: await createBunPostgresStorage({
+ *     url: 'postgres://localhost/mydb',
+ *     table: 'adk_sessions',
+ *     nameColumn: 'session_id',
+ *     propertiesColumn: 'state',
+ *   }),
+ * })
  */
 export async function createBunPostgresStorage(
   options: BunPostgresStorageOptions = {}
 ): Promise<StorageFactory> {
   const schema = options.schema ?? 'public'
   const table = options.table ?? 'krules_subjects'
+  const nameCol = options.nameColumn ?? 'name'
+  const propsCol = options.propertiesColumn ?? 'properties'
 
   let sql: BunSQL
 
@@ -341,7 +426,7 @@ export async function createBunPostgresStorage(
   }
 
   // Ensure schema exists
-  await ensureSchema(sql, schema, table)
+  const columnConfig = await ensureSchema(sql, schema, table, nameCol, propsCol)
 
-  return (subjectName: string) => new BunPostgresStorage(subjectName, { ...options, sql })
+  return (subjectName: string) => new BunPostgresStorage(subjectName, { ...options, sql }, columnConfig)
 }

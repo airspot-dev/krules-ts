@@ -317,6 +317,25 @@ CREATE TABLE subjects (
 CREATE INDEX idx_subjects_properties ON subjects USING GIN (properties);
 ```
 
+#### Custom Column Mapping
+
+You can attach KRules subjects to pre-existing tables by mapping custom column names for the subject identifier and properties. This is useful for integrating with external systems (e.g., ADK sessions) where the table schema is already defined.
+
+```typescript
+// Attach to an existing "adk_sessions" table
+const pgFactory = await createPostgresStorage({
+  sql: sqlClient,
+  table: 'adk_sessions',
+  nameColumn: 'session_id',    // default: 'name'
+  propertiesColumn: 'state',   // default: 'properties'
+})
+
+const session = container.subject('sess:abc')
+await session.set('step', 'processing')  // writes to the "state" JSONB column
+```
+
+When the table already exists, KRules checks for the required columns and adds them if missing. Existing columns and data are never modified. `created_at`/`updated_at` are only added when creating a new table.
+
 #### Generated Columns for Subject Type
 
 With naming conventions like `user:123` or `device:sensor:456`, extract the type automatically:

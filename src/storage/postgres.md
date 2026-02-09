@@ -18,6 +18,72 @@ CREATE TABLE subjects (
 CREATE INDEX idx_subjects_properties ON subjects USING GIN (properties);
 ```
 
+The column names for the subject identifier and properties are configurable
+via `nameColumn` and `propertiesColumn` options (see [Custom Column Mapping](#custom-column-mapping) below).
+
+## Custom Column Mapping
+
+When integrating with pre-existing tables (e.g., ADK sessions, external systems),
+you can map KRules subjects to existing columns instead of using the defaults.
+
+### Configuration
+
+```typescript
+import postgres from 'postgres'
+import { createPostgresStorage } from 'krules/storage/postgres'
+
+const sql = postgres('postgres://localhost/mydb')
+
+// Attach to an existing "adk_sessions" table
+const storageFactory = await createPostgresStorage({
+  sql,
+  table: 'adk_sessions',
+  nameColumn: 'session_id',       // maps to "session_id" instead of "name"
+  propertiesColumn: 'state',      // maps to "state" instead of "properties"
+})
+```
+
+### Schema Behavior
+
+On initialization, `createPostgresStorage` inspects the database:
+
+| Scenario | Behavior |
+|----------|----------|
+| **Table does not exist** | Creates it with all columns: `nameColumn` (PK), `propertiesColumn` (JSONB), `created_at`, `updated_at`, plus a GIN index. |
+| **Table exists, columns present** | No schema changes. Detects whether `updated_at` exists for conditional use in queries. |
+| **Table exists, columns missing** | Adds the missing `nameColumn` / `propertiesColumn` via `ALTER TABLE`. Does **not** add `created_at` or `updated_at` to pre-existing tables. |
+
+### Example: ADK Sessions Integration
+
+Given an existing table:
+
+```sql
+CREATE TABLE adk_sessions (
+  session_id VARCHAR(256) PRIMARY KEY,
+  user_id VARCHAR(256),
+  state JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+KRules attaches transparently:
+
+```typescript
+const factory = await createPostgresStorage({
+  sql,
+  table: 'adk_sessions',
+  nameColumn: 'session_id',
+  propertiesColumn: 'state',
+})
+
+const session = container.subject('sess:abc')
+await session.set('step', 'processing')   // writes to "state" JSONB column
+await session.get('step')                 // reads from "state" JSONB column
+```
+
+- The `user_id` column and any other existing columns are left untouched.
+- Since this table has no `updated_at`, the storage will skip `updated_at = NOW()` in queries automatically.
+
 ## Generated Columns for Subject Type
 
 When using naming conventions like `user:123` or `device:sensor:456`,
