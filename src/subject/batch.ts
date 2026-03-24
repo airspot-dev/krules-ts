@@ -126,10 +126,15 @@ export class BatchBuilder {
         }
       } else {
         // Resolve callable values
-        const newValue =
-          typeof change.value === 'function'
-            ? (change.value as (old: unknown) => unknown)(oldValue)
-            : change.value
+        const isCallable = typeof change.value === 'function'
+        // Snapshot oldValue BEFORE the closure runs, so in-place mutation
+        // doesn't make oldValue === newValue (reference comparison)
+        const snapshotOldValue = isCallable && oldValue != null && typeof oldValue === 'object'
+          ? structuredClone(oldValue)
+          : oldValue
+        const newValue = isCallable
+          ? (change.value as (old: unknown) => unknown)(oldValue)
+          : change.value
 
         // Determine insert vs update
         if (property in current) {
@@ -139,11 +144,11 @@ export class BatchBuilder {
         }
 
         // Track event if value changed
-        if (newValue !== oldValue) {
+        if (newValue !== snapshotOldValue) {
           events.push({
             type: 'changed',
             property,
-            oldValue,
+            oldValue: snapshotOldValue,
             newValue,
             muted: change.muted,
             extra: change.extra,

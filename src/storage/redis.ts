@@ -132,10 +132,16 @@ export class RedisStorage implements Storage {
 
         // Get current value
         const oldValueRaw = await this.client.hget(this.hashKey, property)
-        const oldValue = oldValueRaw ? JSON.parse(oldValueRaw) : undefined
+        const parsedOldValue = oldValueRaw ? JSON.parse(oldValueRaw) : undefined
+
+        // Snapshot oldValue BEFORE the closure runs, so in-place mutation
+        // doesn't make oldValue === newValue (reference comparison)
+        const oldValue = parsedOldValue != null && typeof parsedOldValue === 'object'
+          ? structuredClone(parsedOldValue)
+          : parsedOldValue
 
         // Compute new value
-        const newValue = fn(oldValue)
+        const newValue = fn(parsedOldValue)
 
         // Execute transaction
         const pipeline = this.client.multi()

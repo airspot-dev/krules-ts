@@ -148,10 +148,16 @@ export class BunRedisStorage implements Storage {
       try {
         // Get current value
         const oldValueRaw = await client.send('HGET', [this.hashKey, property]) as string | null
-        const oldValue = oldValueRaw ? JSON.parse(oldValueRaw) : undefined
+        const parsedOldValue = oldValueRaw ? JSON.parse(oldValueRaw) : undefined
+
+        // Snapshot oldValue BEFORE the closure runs, so in-place mutation
+        // doesn't make oldValue === newValue (reference comparison)
+        const oldValue = parsedOldValue != null && typeof parsedOldValue === 'object'
+          ? structuredClone(parsedOldValue)
+          : parsedOldValue
 
         // Compute new value
-        const newValue = fn(oldValue)
+        const newValue = fn(parsedOldValue)
 
         // Start transaction
         await client.send('MULTI', [])

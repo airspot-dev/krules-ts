@@ -63,11 +63,17 @@ export class InMemoryStorage implements Storage {
 
   async set(property: string, value: unknown): Promise<SetResult> {
     const store = this.getStore()
-    const oldValue = store.get(property)
+    const rawOldValue = store.get(property)
 
-    // Handle callable values for atomic operations
-    const newValue = typeof value === 'function'
-      ? (value as (old: unknown) => unknown)(oldValue)
+    // Snapshot oldValue BEFORE the closure runs, so in-place mutation
+    // doesn't make oldValue === newValue (reference comparison)
+    const isCallable = typeof value === 'function'
+    const oldValue = isCallable && rawOldValue != null && typeof rawOldValue === 'object'
+      ? structuredClone(rawOldValue)
+      : rawOldValue
+
+    const newValue = isCallable
+      ? (value as (old: unknown) => unknown)(rawOldValue)
       : value
 
     store.set(property, newValue)

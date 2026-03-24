@@ -256,8 +256,14 @@ export class PostgresStorage implements Storage {
       )
 
       const oldProperties = this.parseProperties(oldRows[0]?.properties)
-      const oldValue = oldProperties[property]
-      const newValue = fn(oldValue)
+      const parsedOldValue = oldProperties[property]
+
+      // Snapshot oldValue BEFORE the closure runs, so in-place mutation
+      // doesn't make oldValue === newValue (reference comparison)
+      const oldValue = parsedOldValue != null && typeof parsedOldValue === 'object'
+        ? structuredClone(parsedOldValue)
+        : parsedOldValue
+      const newValue = fn(parsedOldValue)
 
       // Build new properties object in JavaScript
       const newProperties = { ...oldProperties, [property]: newValue }
