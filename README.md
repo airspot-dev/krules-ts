@@ -267,6 +267,46 @@ on('device.?').run(...)         // matches device.1, device.A, but not device.10
 on('user.login', 'user.logout').run(...)  // matches either event
 ```
 
+### Middleware
+
+Middleware wraps the event dispatch pipeline with cross-cutting concerns like logging, metrics, tracing, or audit. It runs **once per emitted event**, before handler dispatch, **regardless of whether any handler matches or passes its filters**. This guarantees every event is observable, including events with no subscribers.
+
+```typescript
+const { on, middleware, emit } = container.handlers()
+
+// Logging middleware: sees every event, even orphan ones
+middleware(async (ctx, next) => {
+  console.log(`→ ${ctx.eventType} on ${ctx.subject.name}`)
+  await next()
+  console.log(`← ${ctx.eventType} done`)
+})
+
+// Timing middleware: measure total dispatch time for the event
+middleware(async (ctx, next) => {
+  const start = performance.now()
+  await next()
+  const elapsed = performance.now() - start
+  console.log(`${ctx.eventType} dispatched in ${elapsed.toFixed(2)}ms`)
+})
+
+// Handlers may or may not exist; middleware still runs
+await emit('system.heartbeat', container.subject('system:monitor'))
+```
+
+**Execution order**: middlewares run in registration order (first registered = outermost, runs first on the way in and last on the way out). Calling `next()` invokes the rest of the chain — omitting `next()` short-circuits dispatch and no handlers will run for that event.
+
+```typescript
+// Short-circuit example: block events from a specific subject
+middleware(async (ctx, next) => {
+  if (ctx.subject.name.startsWith('test:')) {
+    return  // skip dispatch entirely
+  }
+  await next()
+})
+```
+
+Errors thrown inside middleware propagate to the `emit()` caller. Errors thrown by handlers are caught and logged, so they do not break the middleware chain or stop other handlers.
+
 ### Handler Lifecycle
 
 Handlers can be named for later removal.

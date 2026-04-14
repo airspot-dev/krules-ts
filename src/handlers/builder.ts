@@ -120,7 +120,12 @@ export function createHandlers(eventBus: EventBus): {
     },
 
     /**
-     * Register middleware that runs for ALL events.
+     * Register middleware that runs once per emitted event.
+     *
+     * Middleware runs before handler dispatch, regardless of whether
+     * any handler matches the event or passes its filters. This makes
+     * it suitable for cross-cutting concerns like logging, metrics,
+     * tracing, and audit that must observe every event.
      *
      * @param fn - Middleware function
      *

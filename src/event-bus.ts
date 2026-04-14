@@ -104,7 +104,8 @@ export class EventBus {
 
   /**
    * Add middleware to the execution chain.
-   * Middleware runs for ALL events.
+   * Middleware runs once per emitted event, before handler dispatch,
+   * regardless of whether any handler matches or passes filters.
    * First registered = outermost (runs first before, last after).
    */
   addMiddleware(fn: MiddlewareFunction): void {
@@ -149,30 +150,31 @@ export class EventBus {
       options?.newValue
     )
 
-    // Find matching handlers
-    const matchingHandlers = this.handlers.filter((handler) =>
-      handler.patterns.some((pattern) => this.matchPattern(pattern, eventType))
-    )
+    // Dispatch: match handlers, evaluate filters, execute
+    const dispatch = async (): Promise<void> => {
+      const matchingHandlers = this.handlers.filter((handler) =>
+        handler.patterns.some((pattern) => this.matchPattern(pattern, eventType))
+      )
 
-    // Execute each matching handler
-    for (const handler of matchingHandlers) {
-      try {
-        // Check filters
-        const filtersPassed = await this.evaluateFilters(handler.filters, ctx)
-        if (!filtersPassed) {
-          continue
+      for (const handler of matchingHandlers) {
+        try {
+          const filtersPassed = await this.evaluateFilters(handler.filters, ctx)
+          if (!filtersPassed) {
+            continue
+          }
+          await handler.fn(ctx)
+        } catch (error) {
+          // Log error but don't stop other handlers
+          console.error(
+            `Error in handler "${handler.name}" for event "${eventType}":`,
+            error
+          )
         }
-
-        // Execute with middleware chain
-        await this.executeWithMiddleware(handler.fn, ctx)
-      } catch (error) {
-        // Log error but don't stop other handlers
-        console.error(
-          `Error in handler "${handler.name}" for event "${eventType}":`,
-          error
-        )
       }
     }
+
+    // Wrap dispatch with middleware chain (runs once per event)
+    await this.runMiddlewareChain(ctx, dispatch)
   }
 
   /**
@@ -222,16 +224,14 @@ export class EventBus {
   }
 
   /**
-   * Execute handler with middleware chain.
+   * Wrap a dispatch function with the registered middleware chain.
+   * Middleware runs once per event, regardless of handler matching.
    */
-  private async executeWithMiddleware(
-    handler: HandlerFunction,
-    ctx: EventContext
+  private async runMiddlewareChain(
+    ctx: EventContext,
+    dispatch: () => Promise<void>
   ): Promise<void> {
-    // Build middleware chain from end to start
-    let chain: () => Promise<void> = async () => {
-      await handler(ctx)
-    }
+    let chain = dispatch
 
     // Wrap with middleware (reverse order so first added runs first)
     for (let i = this.middlewares.length - 1; i >= 0; i--) {
@@ -242,7 +242,6 @@ export class EventBus {
       }
     }
 
-    // Execute the chain
     await chain()
   }
 
