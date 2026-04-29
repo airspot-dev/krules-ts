@@ -47,7 +47,11 @@ import { Subject } from './subject/subject'
 import { createMemoryStorage, type StorageFactory } from './storage'
 import { createHandlers } from './handlers/builder'
 import type { HandlerBuilder } from './handlers/builder'
-import type { MiddlewareFunction, EmitFunction } from './handlers/types'
+import type {
+  MiddlewareFunction,
+  EmitFunction,
+  ErrorHandler,
+} from './handlers/types'
 
 /**
  * Container cradle interface - defines all registered services
@@ -59,6 +63,7 @@ export interface KRulesCradle {
   handlers: {
     on: (...patterns: string[]) => HandlerBuilder
     middleware: (fn: MiddlewareFunction) => void
+    onError: (fn: ErrorHandler) => void
     emit: EmitFunction
   }
 }

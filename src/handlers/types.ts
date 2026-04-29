@@ -76,6 +76,34 @@ export type MiddlewareFunction = (
 ) => Promise<void>
 
 /**
+ * Error handler called when a handler throws during dispatch.
+ *
+ * Per-handler error handlers (registered via `on(...).onError(...)`) take
+ * precedence over the global handler. If neither is set, errors fall back
+ * to `console.error`.
+ *
+ * Errors thrown by the error handler itself are logged via `console.error`
+ * and swallowed, so a buggy error handler can't break dispatch.
+ */
+export type ErrorHandler = (
+  error: unknown,
+  ctx: EventContext,
+  handlerName: string
+) => void | Promise<void>
+
+/**
+ * Controls what happens when a handler throws during emit().
+ *
+ * - `continue` (default): log/notify and proceed with remaining handlers.
+ *   `emit()` resolves normally.
+ * - `fail-fast`: invoke error handler, then re-throw the first error.
+ *   Remaining handlers do NOT run.
+ * - `aggregate`: run all handlers, collect errors, throw an `AggregateError`
+ *   at the end if any failed.
+ */
+export type ErrorMode = 'continue' | 'fail-fast' | 'aggregate'
+
+/**
  * Registered handler with metadata.
  * Used internally by EventBus.
  */
@@ -91,6 +119,17 @@ export interface RegisteredHandler {
 
   /** Filter conditions (all must pass) */
   filters: FilterFunction[]
+
+  /** Per-handler error callback (overrides the bus-global onError). */
+  onError?: ErrorHandler
+}
+
+/**
+ * Per-emit options exposed to user code.
+ */
+export interface EmitOptions {
+  /** Override the bus default error mode for this emit. */
+  errorMode?: ErrorMode
 }
 
 /**
@@ -100,5 +139,6 @@ export type EmitFunction = (
   eventType: string,
   subject: Subject,
   payload?: unknown,
-  extra?: Record<string, unknown>
+  extra?: Record<string, unknown>,
+  options?: EmitOptions
 ) => Promise<void>

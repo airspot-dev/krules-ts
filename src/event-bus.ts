@@ -15,6 +15,8 @@ import type {
   FilterFunction,
   MiddlewareFunction,
   RegisteredHandler,
+  ErrorHandler,
+  ErrorMode,
 } from './handlers/types'
 
 /**
@@ -55,6 +57,8 @@ export class EventBus {
   private handlers: RegisteredHandler[] = []
   private middlewares: MiddlewareFunction[] = []
   private handlerCounter = 0
+  private errorHandler?: ErrorHandler
+  private defaultErrorMode: ErrorMode = 'continue'
 
   /**
    * Register a handler for event patterns.
@@ -63,12 +67,14 @@ export class EventBus {
    * @param patterns - Event patterns to match (supports *, ?)
    * @param filters - Filter conditions (all must pass)
    * @param name - Optional handler name for unregistration
+   * @param onError - Optional per-handler error callback
    */
   register(
     fn: HandlerFunction,
     patterns: string[],
     filters: FilterFunction[] = [],
-    name?: string
+    name?: string,
+    onError?: ErrorHandler
   ): string {
     const handlerName = name ?? `handler_${++this.handlerCounter}`
 
@@ -77,6 +83,7 @@ export class EventBus {
       fn,
       patterns,
       filters,
+      onError,
     })
 
     return handlerName
@@ -120,6 +127,33 @@ export class EventBus {
   }
 
   /**
+   * Register a global error handler invoked when a handler throws.
+   *
+   * Replaces any previously registered global error handler. Per-handler
+   * `onError` callbacks (set via the builder) take precedence — the global
+   * handler only runs when the handler did not register its own.
+   */
+  onError(fn: ErrorHandler): void {
+    this.errorHandler = fn
+  }
+
+  /**
+   * Remove the global error handler. After this, handler errors fall back
+   * to `console.error` unless a per-handler `onError` is set.
+   */
+  clearErrorHandler(): void {
+    this.errorHandler = undefined
+  }
+
+  /**
+   * Set the default error mode applied when emit() is called without an
+   * explicit `errorMode` option. Defaults to `'continue'`.
+   */
+  setDefaultErrorMode(mode: ErrorMode): void {
+    this.defaultErrorMode = mode
+  }
+
+  /**
    * Emit an event to all matching handlers.
    *
    * @param eventType - The event type string
@@ -137,6 +171,7 @@ export class EventBus {
       propertyName?: string
       oldValue?: unknown
       newValue?: unknown
+      errorMode?: ErrorMode
     }
   ): Promise<void> {
     const ctx = new EventContextImpl(
@@ -149,6 +184,9 @@ export class EventBus {
       options?.oldValue,
       options?.newValue
     )
+
+    const errorMode: ErrorMode = options?.errorMode ?? this.defaultErrorMode
+    const collected: unknown[] = []
 
     // Dispatch: match handlers, evaluate filters, execute
     const dispatch = async (): Promise<void> => {
@@ -164,17 +202,57 @@ export class EventBus {
           }
           await handler.fn(ctx)
         } catch (error) {
-          // Log error but don't stop other handlers
-          console.error(
-            `Error in handler "${handler.name}" for event "${eventType}":`,
-            error
-          )
+          await this.notifyHandlerError(error, ctx, handler)
+
+          if (errorMode === 'fail-fast') {
+            throw error
+          }
+          if (errorMode === 'aggregate') {
+            collected.push(error)
+          }
         }
+      }
+
+      if (errorMode === 'aggregate' && collected.length > 0) {
+        throw new AggregateError(
+          collected,
+          `${collected.length} handler(s) failed for event "${eventType}"`
+        )
       }
     }
 
     // Wrap dispatch with middleware chain (runs once per event)
     await this.runMiddlewareChain(ctx, dispatch)
+  }
+
+  /**
+   * Invoke per-handler onError, then global onError, then console.error
+   * fallback. Errors thrown by the error handler itself are caught and
+   * logged so dispatch is never broken by a buggy hook.
+   */
+  private async notifyHandlerError(
+    error: unknown,
+    ctx: EventContext,
+    handler: RegisteredHandler
+  ): Promise<void> {
+    const hook = handler.onError ?? this.errorHandler
+    if (!hook) {
+      console.error(
+        `Error in handler "${handler.name}" for event "${ctx.eventType}":`,
+        error
+      )
+      return
+    }
+    try {
+      await hook(error, ctx, handler.name)
+    } catch (hookError) {
+      console.error(
+        `onError hook threw while handling error from "${handler.name}" for event "${ctx.eventType}". Original error:`,
+        error,
+        'Hook error:',
+        hookError
+      )
+    }
   }
 
   /**

@@ -1,6 +1,6 @@
 {
   "name": "krules",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Event-driven, reactive state management framework for TypeScript and Bun",
   "license": "Apache-2.0",
   "author": "Airspot",
