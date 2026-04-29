@@ -25,6 +25,8 @@ import type {
   FilterFunction,
   MiddlewareFunction,
   EmitFunction,
+  ErrorHandler,
+  EmitOptions,
 } from './types'
 import type { Subject } from '../subject/subject'
 
@@ -34,6 +36,7 @@ import type { Subject } from '../subject/subject'
 export class HandlerBuilder {
   private filters: FilterFunction[] = []
   private handlerName?: string
+  private errorHandler?: ErrorHandler
 
   constructor(
     private readonly eventBus: EventBus,
@@ -63,6 +66,25 @@ export class HandlerBuilder {
   }
 
   /**
+   * Attach a per-handler error callback. Invoked when this handler throws,
+   * before the dispatcher applies the active errorMode. Overrides the
+   * bus-global onError for this handler only.
+   *
+   * @param fn - Error callback receiving (error, ctx, handlerName)
+   *
+   * @example
+   * on('payment.process')
+   *   .onError(async (err, ctx) => {
+   *     await ctx.emit('payment.failed', ctx.subject, { reason: String(err) })
+   *   })
+   *   .run(async (ctx) => { ... })
+   */
+  onError(fn: ErrorHandler): this {
+    this.errorHandler = fn
+    return this
+  }
+
+  /**
    * Register the handler function.
    * This finalizes the handler registration.
    *
@@ -70,7 +92,13 @@ export class HandlerBuilder {
    * @returns Handler name (for unregistration)
    */
   run(fn: HandlerFunction): string {
-    return this.eventBus.register(fn, this.patterns, this.filters, this.handlerName)
+    return this.eventBus.register(
+      fn,
+      this.patterns,
+      this.filters,
+      this.handlerName,
+      this.errorHandler
+    )
   }
 }
 
@@ -96,6 +124,7 @@ export class HandlerBuilder {
 export function createHandlers(eventBus: EventBus): {
   on: (...patterns: string[]) => HandlerBuilder
   middleware: (fn: MiddlewareFunction) => void
+  onError: (fn: ErrorHandler) => void
   emit: EmitFunction
 } {
   return {
@@ -141,23 +170,48 @@ export function createHandlers(eventBus: EventBus): {
     },
 
     /**
+     * Register a global error callback invoked when any handler throws.
+     *
+     * Per-handler `onError` callbacks take precedence. If neither is set,
+     * errors are logged via `console.error`.
+     *
+     * @param fn - Error callback receiving (error, ctx, handlerName)
+     *
+     * @example
+     * onError((err, ctx, handlerName) => {
+     *   logger.error({ err, eventType: ctx.eventType, handlerName })
+     * })
+     */
+    onError: (fn: ErrorHandler): void => {
+      eventBus.onError(fn)
+    },
+
+    /**
      * Emit an event.
      *
      * @param eventType - Event type string
      * @param subject - Subject associated with this event
      * @param payload - Optional event payload
      * @param extra - Optional extra context
+     * @param options - Optional per-emit options (e.g. errorMode override)
      *
      * @example
      * await emit('user.created', user, { email: 'john@example.com' })
+     *
+     * @example
+     * // Stop on first handler error and propagate it to the caller.
+     * await emit('payment.process', user, { amount: 100 }, undefined, {
+     *   errorMode: 'fail-fast',
+     * })
      */
     emit: async (
       eventType: string,
       subject: Subject,
       payload?: unknown,
-      extra?: Record<string, unknown>
+      extra?: Record<string, unknown>,
+      options?: EmitOptions
     ): Promise<void> => {
-      await eventBus.emit(eventType, subject, payload, extra)
+      await eventBus.emit(eventType, subject, payload, extra, options)
     },
   }
 }

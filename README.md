@@ -305,7 +305,111 @@ middleware(async (ctx, next) => {
 })
 ```
 
-Errors thrown inside middleware propagate to the `emit()` caller. Errors thrown by handlers are caught and logged, so they do not break the middleware chain or stop other handlers.
+Errors thrown inside middleware propagate to the `emit()` caller. Errors thrown by handlers are caught and routed through the error-handling pipeline (see below) — by default they are logged and do not stop other handlers.
+
+### Error Handling
+
+By default, when a handler throws, the dispatcher continues with remaining handlers (fail-safe) and logs the error via `console.error`. You can intercept errors at two levels and control how `emit()` reacts via the `errorMode` option.
+
+#### Global error callback
+
+```typescript
+const { on, onError, emit } = container.handlers()
+
+// Replaces the console.error fallback
+onError((err, ctx, handlerName) => {
+  logger.error({ err, eventType: ctx.eventType, handlerName })
+  metrics.increment('handler.error', { handler: handlerName })
+})
+```
+
+The global `onError` is invoked for any handler error that does not have a per-handler override. If the hook itself throws, the error is logged and dispatch continues — a buggy hook can never break the bus.
+
+#### Per-handler error callback
+
+```typescript
+on('payment.process')
+  .onError(async (err, ctx) => {
+    // e.g. emit a compensating event so downstream consumers can react
+    await ctx.emit('payment.failed', ctx.subject, { reason: String(err) })
+  })
+  .run(async (ctx) => {
+    await chargeCard(ctx.payload)
+  })
+```
+
+The per-handler `onError` takes precedence over the global one for that handler only.
+
+#### Error mode
+
+`emit()` accepts an `errorMode` option that controls how dispatch reacts to handler failures:
+
+| Mode | Behavior |
+| --- | --- |
+| `'continue'` (default) | Run all matching handlers. Errors are notified via `onError` (or logged) and `emit()` resolves normally. |
+| `'fail-fast'` | Stop on the first error. The error handler runs, then the error is re-thrown to the `emit()` caller. Remaining handlers do **not** run. |
+| `'aggregate'` | Run all handlers, collect every error, and throw a standard `AggregateError` at the end if any failed. |
+
+```typescript
+// Default: log and keep going
+await emit('user.created', user, { email: 'john@example.com' })
+
+// Transactional flow: stop and surface the failure to the caller
+await emit('payment.process', user, { amount: 100 }, undefined, {
+  errorMode: 'fail-fast',
+})
+
+// Run everything, then report all failures together
+try {
+  await emit('order.placed', order, payload, undefined, {
+    errorMode: 'aggregate',
+  })
+} catch (err) {
+  if (err instanceof AggregateError) {
+    for (const e of err.errors) console.error('handler failed:', e)
+  }
+}
+```
+
+To change the default for the whole bus:
+
+```typescript
+container.eventBus.setDefaultErrorMode('fail-fast')
+```
+
+#### Building retry / dead-letter queues on top
+
+`krules` intentionally does not ship retry policies or a dead-letter queue. The combination of `onError`, `errorMode: 'aggregate'`, and `middleware` gives you the building blocks to implement either with the exact semantics your domain needs.
+
+```typescript
+// Minimal dead-letter pattern: persist failed events from the global hook
+onError(async (err, ctx, handlerName) => {
+  await deadLetters.set(`${ctx.eventType}:${Date.now()}`, {
+    handler: handlerName,
+    payload: ctx.payload,
+    error: String(err),
+  })
+})
+```
+
+```typescript
+// Per-handler retry pattern: wrap the handler body, not the framework
+on('flaky.task').run(async (ctx) => {
+  let lastErr: unknown
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await doWork(ctx.payload)
+      return
+    } catch (e) {
+      lastErr = e
+      await new Promise((r) => setTimeout(r, 100 * 2 ** attempt))
+    }
+  }
+  throw lastErr
+})
+```
+
+This keeps idempotency and backoff decisions explicit at the call site, where they belong.
 
 ### Handler Lifecycle
 

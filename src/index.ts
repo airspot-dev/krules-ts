@@ -68,6 +68,9 @@ export type {
   FilterFunction,
   MiddlewareFunction,
   EmitFunction,
+  EmitOptions,
+  ErrorHandler,
+  ErrorMode,
 } from './handlers/types'
 
 // Storage
