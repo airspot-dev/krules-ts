@@ -46,6 +46,27 @@
  */
 
 import type { Storage, StorageChanges, SetResult, DeleteResult, StorageFactory } from './types'
+import {
+  applySchemaCustomization,
+  type ResolvedComputedColumn,
+  type SchemaCustomization,
+  type SqlExecutor,
+} from './postgres-schema'
+
+export type {
+  ColumnDefinition,
+  ColumnType,
+  CompositeIndexDefinition,
+  CompositeIndexTarget,
+  ComputedColumnDefinition,
+  ComputedState,
+  GeneratedColumnDefinition,
+  GeneratedSource,
+  IndexFilter,
+  NameExtractor,
+  PropertyIndexDefinition,
+  SchemaCustomization,
+} from './postgres-schema'
 
 // postgres.js types - keep optional
 type Sql = {
@@ -66,15 +87,28 @@ export interface PostgresStorageOptions {
   nameColumn?: string
   /** Column name for the JSONB properties (default: 'properties') */
   propertiesColumn?: string
+  /**
+   * Optional schema customization: generated/computed columns, property indexes,
+   * composite indexes. See ./postgres-schema.ts for full type details, and
+   * ./postgres.md for usage and trade-offs (notably the Supabase Realtime
+   * motivation for promoting JSONB properties to real columns).
+   */
+  customSchema?: SchemaCustomization
 }
 
 /** Resolved column configuration from schema inspection */
 interface ResolvedColumnConfig {
   hasUpdatedAt: boolean
+  computedColumns: ResolvedComputedColumn[]
 }
 
-/** Shared initialization state */
-const initializedTables = new Map<string, ResolvedColumnConfig>()
+/** Wrap a postgres.js client into the driver-agnostic SqlExecutor. */
+function makeExecutor(sql: Sql): SqlExecutor {
+  return {
+    query: <T = unknown>(q: string, params?: unknown[]) =>
+      sql.unsafe<T[]>(q, params) as unknown as Promise<T[]>,
+  }
+}
 
 /**
  * Ensure the subjects table and required columns exist.
@@ -87,12 +121,14 @@ async function ensureSchema(
   schema: string,
   table: string,
   nameCol: string,
-  propsCol: string
+  propsCol: string,
+  customSchema: SchemaCustomization | undefined
 ): Promise<ResolvedColumnConfig> {
   const fullTable = `"${schema}"."${table}"`
 
-  const cached = initializedTables.get(fullTable)
-  if (cached) return cached
+  // No memoization: the customization step is idempotent (IF NOT EXISTS,
+  // checks against information_schema), and a memoized result would silently
+  // discard a different `customSchema` passed on a subsequent factory call.
 
   // Check if table exists
   const tableExistsResult = await sql.unsafe<[{ exists: boolean }]>(
@@ -103,9 +139,9 @@ async function ensureSchema(
     [schema, table]
   )
 
-  const tableExists = tableExistsResult[0]?.exists ?? false
+  const tableExistedBefore = tableExistsResult[0]?.exists ?? false
 
-  if (!tableExists) {
+  if (!tableExistedBefore) {
     // Create new table with all columns
     await sql.unsafe(`
       CREATE TABLE ${fullTable} (
@@ -120,35 +156,52 @@ async function ensureSchema(
       CREATE INDEX IF NOT EXISTS "idx_${table}_${propsCol}"
       ON ${fullTable} USING GIN ("${propsCol}")
     `)
+  } else {
+    // Table exists - check for required columns
+    const columns = await sql.unsafe<{ column_name: string }[]>(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = $1 AND table_name = $2`,
+      [schema, table]
+    )
+    const existingColumns = new Set(columns.map(c => c.column_name))
 
-    const config: ResolvedColumnConfig = { hasUpdatedAt: true }
-    initializedTables.set(fullTable, config)
-    return config
+    if (!existingColumns.has(nameCol)) {
+      await sql.unsafe(`ALTER TABLE ${fullTable} ADD COLUMN "${nameCol}" VARCHAR(512)`)
+    }
+
+    if (!existingColumns.has(propsCol)) {
+      await sql.unsafe(`ALTER TABLE ${fullTable} ADD COLUMN "${propsCol}" JSONB NOT NULL DEFAULT '{}'::jsonb`)
+      await sql.unsafe(`
+        CREATE INDEX IF NOT EXISTS "idx_${table}_${propsCol}"
+        ON ${fullTable} USING GIN ("${propsCol}")
+      `)
+    }
   }
 
-  // Table exists - check for required columns
-  const columns = await sql.unsafe<{ column_name: string }[]>(
+  // Re-inspect after any base-table changes to get the final hasUpdatedAt flag.
+  const finalColumns = await sql.unsafe<{ column_name: string }[]>(
     `SELECT column_name FROM information_schema.columns
      WHERE table_schema = $1 AND table_name = $2`,
     [schema, table]
   )
-  const existingColumns = new Set(columns.map(c => c.column_name))
+  const finalExisting = new Set(finalColumns.map(c => c.column_name))
+  const hasUpdatedAt = !tableExistedBefore || finalExisting.has('updated_at')
 
-  if (!existingColumns.has(nameCol)) {
-    await sql.unsafe(`ALTER TABLE ${fullTable} ADD COLUMN "${nameCol}" VARCHAR(512)`)
+  // Apply optional schema customization (generated/computed columns, indexes).
+  let computedColumns: ResolvedComputedColumn[] = []
+  if (customSchema) {
+    computedColumns = await applySchemaCustomization({
+      exec: makeExecutor(sql),
+      schema,
+      table,
+      nameCol,
+      propsCol,
+      customization: customSchema,
+      isNewTable: !tableExistedBefore,
+    })
   }
 
-  if (!existingColumns.has(propsCol)) {
-    await sql.unsafe(`ALTER TABLE ${fullTable} ADD COLUMN "${propsCol}" JSONB NOT NULL DEFAULT '{}'::jsonb`)
-    await sql.unsafe(`
-      CREATE INDEX IF NOT EXISTS "idx_${table}_${propsCol}"
-      ON ${fullTable} USING GIN ("${propsCol}")
-    `)
-  }
-
-  const config: ResolvedColumnConfig = { hasUpdatedAt: existingColumns.has('updated_at') }
-  initializedTables.set(fullTable, config)
-  return config
+  return { hasUpdatedAt, computedColumns }
 }
 
 /**
@@ -161,6 +214,11 @@ export class PostgresStorage implements Storage {
   private readonly nameCol: string
   private readonly propsCol: string
   private readonly hasUpdatedAt: boolean
+  private readonly computedColumns: ResolvedComputedColumn[]
+  /** Pre-built upsert SQL — depends only on factory-level config, not subject. */
+  private readonly upsertSql: string
+  /** Pre-built update SQL (for delete operations). */
+  private readonly updateSql: string
 
   constructor(
     public readonly subjectName: string,
@@ -174,6 +232,41 @@ export class PostgresStorage implements Storage {
     this.nameCol = options.nameColumn ?? 'name'
     this.propsCol = options.propertiesColumn ?? 'properties'
     this.hasUpdatedAt = columnConfig.hasUpdatedAt
+    this.computedColumns = columnConfig.computedColumns
+
+    // Build upsert and update SQL once. Param layout:
+    //   $1: subject name
+    //   $2: properties (json text → jsonb)
+    //   $3..$(2+N): computed column values (in order)
+    const cols = [`"${this.nameCol}"`, `"${this.propsCol}"`]
+    const params = ['$1', '$2::text::jsonb']
+    const updates = [`"${this.propsCol}" = $2::text::jsonb`]
+    this.computedColumns.forEach((c, i) => {
+      const p = `$${i + 3}`
+      cols.push(`"${c.name}"`)
+      params.push(p)
+      updates.push(`"${c.name}" = ${p}`)
+    })
+    if (this.hasUpdatedAt) updates.push('updated_at = NOW()')
+
+    this.upsertSql =
+      `INSERT INTO ${this.fullTable} (${cols.join(', ')}) ` +
+      `VALUES (${params.join(', ')}) ` +
+      `ON CONFLICT ("${this.nameCol}") DO UPDATE SET ${updates.join(', ')}`
+
+    // For UPDATE-only (delete path), param layout:
+    //   $1: properties
+    //   $2..$(1+N): computed values
+    //   $(2+N): subject name (WHERE)
+    const updateOnly = [`"${this.propsCol}" = $1::text::jsonb`]
+    this.computedColumns.forEach((c, i) => {
+      updateOnly.push(`"${c.name}" = $${i + 2}`)
+    })
+    if (this.hasUpdatedAt) updateOnly.push('updated_at = NOW()')
+    const wherePos = this.computedColumns.length + 2
+    this.updateSql =
+      `UPDATE ${this.fullTable} SET ${updateOnly.join(', ')} ` +
+      `WHERE "${this.nameCol}" = $${wherePos}`
   }
 
   isPersistent(): boolean {
@@ -184,9 +277,11 @@ export class PostgresStorage implements Storage {
     return true
   }
 
-  /** Returns `, updated_at = NOW()` if the column exists, empty string otherwise */
-  private get updatedAtClause(): string {
-    return this.hasUpdatedAt ? ', updated_at = NOW()' : ''
+  /** Compute values for all computed columns from a snapshot of properties. */
+  private computedValues(properties: Record<string, unknown>): unknown[] {
+    return this.computedColumns.map(c =>
+      c.compute({ name: this.subjectName, properties })
+    )
   }
 
   // ============================================
@@ -231,13 +326,9 @@ export class PostgresStorage implements Storage {
       // Build new properties object in JavaScript
       const newProperties = { ...oldProperties, [property]: value }
 
-      // Upsert with new properties
       await tx.unsafe(
-        `INSERT INTO ${this.fullTable} ("${this.nameCol}", "${this.propsCol}")
-         VALUES ($1, $2::text::jsonb)
-         ON CONFLICT ("${this.nameCol}") DO UPDATE
-         SET "${this.propsCol}" = $2::text::jsonb${this.updatedAtClause}`,
-        [this.subjectName, JSON.stringify(newProperties)]
+        this.upsertSql,
+        [this.subjectName, JSON.stringify(newProperties), ...this.computedValues(newProperties)]
       )
 
       return { newValue: value, oldValue }
@@ -268,13 +359,9 @@ export class PostgresStorage implements Storage {
       // Build new properties object in JavaScript
       const newProperties = { ...oldProperties, [property]: newValue }
 
-      // Upsert with new properties
       await tx.unsafe(
-        `INSERT INTO ${this.fullTable} ("${this.nameCol}", "${this.propsCol}")
-         VALUES ($1, $2::text::jsonb)
-         ON CONFLICT ("${this.nameCol}") DO UPDATE
-         SET "${this.propsCol}" = $2::text::jsonb${this.updatedAtClause}`,
-        [this.subjectName, JSON.stringify(newProperties)]
+        this.upsertSql,
+        [this.subjectName, JSON.stringify(newProperties), ...this.computedValues(newProperties)]
       )
 
       return { newValue, oldValue }
@@ -295,10 +382,9 @@ export class PostgresStorage implements Storage {
       // Build new properties without the deleted property
       const { [property]: _, ...newProperties } = oldProperties
 
-      // Update with new properties
       await tx.unsafe(
-        `UPDATE ${this.fullTable} SET "${this.propsCol}" = $1::text::jsonb${this.updatedAtClause} WHERE "${this.nameCol}" = $2`,
-        [JSON.stringify(newProperties), this.subjectName]
+        this.updateSql,
+        [JSON.stringify(newProperties), ...this.computedValues(newProperties), this.subjectName]
       )
 
       return { oldValue }
@@ -361,13 +447,9 @@ export class PostgresStorage implements Storage {
         delete newProperties[property]
       }
 
-      // Upsert with new properties
       await tx.unsafe(
-        `INSERT INTO ${this.fullTable} ("${this.nameCol}", "${this.propsCol}")
-         VALUES ($1, $2::text::jsonb)
-         ON CONFLICT ("${this.nameCol}") DO UPDATE
-         SET "${this.propsCol}" = $2::text::jsonb${this.updatedAtClause}`,
-        [this.subjectName, JSON.stringify(newProperties)]
+        this.upsertSql,
+        [this.subjectName, JSON.stringify(newProperties), ...this.computedValues(newProperties)]
       )
     })
   }
@@ -426,7 +508,9 @@ export async function createPostgresStorage(
   const propsCol = options.propertiesColumn ?? 'properties'
 
   // Ensure schema exists on factory creation
-  const columnConfig = await ensureSchema(options.sql, schema, table, nameCol, propsCol)
+  const columnConfig = await ensureSchema(
+    options.sql, schema, table, nameCol, propsCol, options.customSchema
+  )
 
   return (subjectName: string) => new PostgresStorage(subjectName, options, columnConfig)
 }

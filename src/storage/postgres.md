@@ -1,7 +1,27 @@
 # PostgreSQL Storage - Advanced Patterns
 
-This document covers advanced PostgreSQL patterns for krules.ts subjects,
-including generated columns, indexing strategies, and query optimization.
+This document covers PostgreSQL patterns for krules.ts subjects, including the
+programmatic schema-customization API (generated/computed columns, property and
+composite indexes) and the underlying SQL idioms it produces.
+
+## Why customize the schema?
+
+A KRules subject is fundamentally a JSONB document keyed by name. That gives
+maximum flexibility but two practical limitations:
+
+1. **Indexing**: queries that filter on a specific JSONB key need explicit
+   expression indexes — the GIN index on the whole document only helps for
+   containment queries.
+2. **Realtime / external filters**: replication-based realtime systems
+   (notably **Supabase Realtime** via `wal2json` / `pgoutput`) can filter
+   subscriptions only on **real columns**, not on JSONB sub-keys. To make a
+   subject property filterable in a Realtime subscription, that property has
+   to be **promoted to a column**.
+
+The `customSchema` option on `createPostgresStorage` / `createBunPostgresStorage`
+addresses both concerns programmatically. The original SQL recipes in this
+document still work and remain useful as reference for cases the API does not
+cover.
 
 ## Table Schema
 
@@ -83,6 +103,184 @@ await session.get('step')                 // reads from "state" JSONB column
 
 - The `user_id` column and any other existing columns are left untouched.
 - Since this table has no `updated_at`, the storage will skip `updated_at = NOW()` in queries automatically.
+
+## Programmatic Schema Customization
+
+`createPostgresStorage` accepts a `customSchema` object that declares
+additional columns and indexes. The factory applies them at startup,
+idempotently and additively.
+
+```typescript
+import postgres from 'postgres'
+import { createPostgresStorage } from 'krules/storage/postgres'
+
+const sql = postgres('postgres://localhost/mydb')
+
+const factory = await createPostgresStorage({
+  sql,
+  table: 'subjects',
+  customSchema: {
+    columns: {
+      // GENERATED column from the subject name → first segment of "type:id"
+      subject_type: {
+        generated: { name: { splitPart: { separator: ':', segment: 1 } } },
+        type: 'text',
+        index: true,
+      },
+
+      // GENERATED column from a JSONB property → promoted for Realtime filters
+      status: {
+        generated: { property: 'status' },
+        type: 'text',
+        index: true,
+      },
+
+      // Numeric promotion with cast
+      coins: {
+        generated: { property: 'coins' },
+        type: 'integer',
+        index: true,
+      },
+
+      // COMPUTED column — derived from multiple properties via a JS closure
+      available: {
+        computed: ({ properties }) => {
+          const stock = (properties.stock as number) ?? 0
+          const reserved = (properties.reserved as number) ?? 0
+          return stock - reserved > 0
+        },
+        type: 'boolean',
+        index: true,
+      },
+    },
+
+    // Expression indexes on JSONB keys (no column promotion)
+    propertyIndexes: [
+      { property: 'last_seen', type: 'timestamptz' },
+    ],
+
+    // Composite index on a real column + a JSONB property
+    compositeIndexes: [
+      {
+        targets: [
+          { column: 'subject_type' },
+          { property: 'status', type: 'text' },
+        ],
+      },
+    ],
+  },
+})
+```
+
+### `columns` — promote values to real columns
+
+Each entry produces a real column on the table. Two flavours:
+
+- **`generated`**: a Postgres `GENERATED ALWAYS AS (…) STORED` column.
+  Computed by the database on every write, cannot drift, cannot be assigned
+  manually. The expression is built from a structured config — never raw SQL.
+
+  Sources:
+  - `{ name: { splitPart: { separator, segment } } }` — Postgres
+    `split_part(name, separator, segment)`. `segment` is **1-indexed** to
+    match Postgres semantics.
+  - `{ name: { regex: 'pattern', group?: 1 } }` — Postgres
+    `(regexp_match(name, 'pattern'))[group]`. Useful when `splitPart` is too
+    coarse. Returns NULL if the pattern doesn't match. `group` is 1-indexed.
+  - `{ name: { tags: { separator } } }` — Postgres
+    `string_to_array(name, separator)`. **Type must be `text[]`**.
+  - `{ property: 'key' }` — Postgres `(properties->>'key')::TYPE`. Used to
+    promote a JSONB key to a real column for Realtime / native indexing.
+
+- **`computed`**: a regular column that the application writes on every
+  `set` / `delete` / `store`. The closure receives `{ name, properties }`
+  with the *new* state and returns the column value. Use this for logic SQL
+  cannot express well — multi-property derivations, complex parsing, etc.
+
+  ⚠️ **Drift risk**: if any process writes the JSONB column directly without
+  going through KRules (a manual `UPDATE`, a different service on the same
+  table, a migration), computed columns will become stale. Prefer `generated`
+  whenever the logic can be expressed as a SQL expression.
+
+  ⚠️ **Backfill**: adding a `computed` column to a table that already has
+  rows raises an error. Either drop and recreate the data, populate the
+  column manually, or use `generated` instead.
+
+Both flavours support `index: true` to create a btree index on the column
+named `idx_<table>_<column>`.
+
+### `propertyIndexes` — index JSONB keys without promotion
+
+When a key needs to be queried efficiently from SQL but does not need to be
+filterable from Realtime, an expression index on the JSONB key is enough:
+
+```typescript
+propertyIndexes: [
+  { property: 'last_seen_ms', type: 'bigint' },                                   // unix epoch ms
+  { property: 'priority',     type: 'integer', where: { column: 'subject_type', equals: 'task' } },
+]
+```
+
+Produces:
+```sql
+CREATE INDEX idx_subjects_prop_last_seen_ms
+  ON subjects (((properties->>'last_seen_ms')::BIGINT));
+
+CREATE INDEX idx_subjects_prop_priority
+  ON subjects (((properties->>'priority')::INTEGER))
+  WHERE "subject_type" = 'task';
+```
+
+> **No timestamp type:** Postgres `text → timestamp[tz]` casts are STABLE
+> (depend on session settings) so they cannot appear in `GENERATED ... STORED`
+> columns or expression indexes. Store timestamps as `bigint` epoch or `text`
+> ISO 8601 (which sorts lexicographically).
+
+The optional `where` is a structured filter `{ column, equals }`. The
+referenced column must be a real column (a base column or one declared in
+`columns`). Raw SQL is intentionally not accepted.
+
+### `compositeIndexes` — multi-target indexes
+
+Each entry combines one or more **structured targets**:
+
+- `{ column: 'name' }` — a real column (base or customized).
+- `{ property: 'key', type: 'text' }` — a JSONB key with cast.
+
+```typescript
+compositeIndexes: [
+  {
+    targets: [
+      { column: 'subject_type' },
+      { property: 'status', type: 'text' },
+    ],
+    where: { column: 'subject_type', equals: 'device' },
+  },
+]
+```
+
+### Identifier rules
+
+Column and property names accepted by the API must match
+`^[a-z_][a-z0-9_]*$` — lowercase ASCII letters, digits, underscores; cannot
+start with a digit. This is intentional and prevents SQL identifier
+injection. Names outside this set are rejected with a clear error.
+
+### Idempotency
+
+The customization step is **purely additive**:
+
+- Columns and indexes that already exist are left untouched.
+- To change a generated expression, the type of a column, or the columns of
+  an index, **drop the object manually first** and re-run the factory.
+
+The reasoning: silent migrations on production tables are a footgun. The
+factory only ever creates what is missing.
+
+### Reserved column names
+
+`name`, `properties`, `created_at`, `updated_at` (and any custom values for
+`nameColumn` / `propertiesColumn`) cannot be redeclared in `columns`.
 
 ## Generated Columns for Subject Type
 
