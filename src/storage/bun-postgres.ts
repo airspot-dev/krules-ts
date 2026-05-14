@@ -81,6 +81,17 @@ export interface BunPostgresStorageOptions {
   /** Column name for the JSONB properties (default: 'properties') */
   propertiesColumn?: string
   /**
+   * Whether Bun.SQL should auto-create prepared statements (default: true).
+   *
+   * Set to `false` when connecting through a transaction-mode connection
+   * pooler such as Supabase's Supavisor on port 6543, where prepared
+   * statements fail with `prepared statement already exists` because the
+   * pooler reassigns backend connections between requests.
+   *
+   * Ignored when `sql` is provided — configure that client yourself.
+   */
+  preparedStatements?: boolean
+  /**
    * Optional schema customization: generated/computed columns, property
    * indexes, composite indexes. See ./postgres-schema.ts and ./postgres.md.
    */
@@ -496,7 +507,11 @@ export async function createBunPostgresStorage(
     // Dynamic import to avoid errors if not running in Bun
     const { SQL } = await import('bun')
     const url = options.url ?? process.env.DATABASE_URL ?? 'postgres://localhost/postgres'
-    sql = new SQL(url) as unknown as BunSQL
+    const clientOptions: { url: string; prepare?: boolean } = { url }
+    if (options.preparedStatements === false) {
+      clientOptions.prepare = false
+    }
+    sql = new SQL(clientOptions) as unknown as BunSQL
   }
 
   // Ensure schema exists
