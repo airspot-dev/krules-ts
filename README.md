@@ -446,6 +446,46 @@ import { createBunRedisStorage } from 'krules/storage/bun-redis'
 const bunRedisFactory = createBunRedisStorage({ url: 'redis://localhost:6379' })
 ```
 
+#### Connection resilience
+
+Bun's `RedisClient` reconnects automatically, but only for a finite `maxRetries`
+budget — once exhausted the cached client is permanently dead. Worse, a frozen or
+unresponsive server (Cloud Run CPU throttling, a silently dropped NAT mapping)
+can leave a **half-open connection that still reports `connected: true` while
+every operation hangs forever** — a state native reconnection never detects.
+
+`createBunRedisStorage` guarantees eventual recovery regardless of outage length:
+every operation runs under a **per-operation timeout**, and on a timeout or
+connection error the dead client is evicted, a fresh one is built and the
+operation is retried once. Long-running services survive Redis/Valkey restarts,
+pod replacements and CPU-throttle wakeups without a manual restart.
+
+```typescript
+const bunRedisFactory = createBunRedisStorage({
+  url: 'redis://localhost:6379',
+  prefix: 'myapp:subjects:',
+  // resilience knobs (defaults shown):
+  autoReconnect: true,        // Bun's native reconnection
+  maxRetries: 20,             // native budget; the rebuild layer is the real guarantee
+  enableOfflineQueue: false,  // fail fast during an outage instead of queueing
+  operationTimeoutMs: 3000,   // guards against half-open/frozen connections that never error
+})
+```
+
+> Idempotent operations (`get`/`set`/`delete`/`store`) retry freely after a
+> rebuild. Atomic callable values (`set(prop, old => ...)`, which use
+> `WATCH/MULTI/EXEC`) are non-idempotent by design, so they are retried **only**
+> when the failure provably occurred *before* `EXEC` was dispatched (nothing
+> could have committed — this safely covers the stale/dead cached-client case).
+> Once `EXEC` is in flight the commit outcome is ambiguous (a lost ack looks the
+> same whether the server committed or died first), so the operation **fails
+> loudly** rather than risk double-applying the callable — regardless of whether
+> the failure is a timeout or a connection error. The per-operation timeout is a
+> nuisance-failure guard, never a correctness mechanism for this decision.
+
+An injected `client` is treated as caller-owned (like the ioredis adapter): it is
+never rebuilt, only the per-operation timeout applies.
+
 ### PostgreSQL Advanced Patterns
 
 PostgreSQL is ideal for subjects with unbounded growth. The base schema uses JSONB for flexible property storage:
