@@ -20,10 +20,12 @@ run against real PostgreSQL and Redis instances on Bun.
   in queue order; muted and unchanged sets emit nothing; a missing delete emits
   nothing; in-place object mutation via a callable preserves the old snapshot
   (old ≠ new).
-- **Concurrency (regression guard)** — N writers, each on its own connection,
-  run parallel batch increments on one property; the final counter must equal
-  the total, proving no lost updates. A whole-batch retry cannot mask a lost
-  update — a non-atomic implementation would still land on the wrong final count.
+- **Concurrency (regression guard)** — N writers run parallel batch increments
+  on one property; the final counter must equal the total, proving no lost
+  updates. A whole-batch retry cannot mask a lost update — a non-atomic
+  implementation would still land on the wrong final count. The writers must
+  exercise genuine contention against a *shared* backend: pooled connections for
+  Postgres, a **single shared client** for Redis (see the guard-gap note below).
 
 # Results
 
@@ -31,14 +33,26 @@ run against real PostgreSQL and Redis instances on Bun.
 |---------|----------------------|--------|
 | `bun-postgres` (Bun native SQL) | 8 pooled connections × 25 = 200 | 11/11 — counter = 200 |
 | `postgres` (node, postgres.js) | 8 pooled connections × 25 = 200 | 11/11 — counter = 200 |
-| `bun-redis` (Bun native) | 4 independent clients × 25 = 100 | 11/11 — counter = 100 |
-| `redis` (node, ioredis) | 4 independent clients × 25 = 100 | 11/11 — counter = 100 |
+| `bun-redis` (Bun native) | 8 writers on 1 shared client × 25 = 200 | 11/11 — counter = 200 |
+| `redis` (node, ioredis) | 8 writers on 1 shared client × 25 = 200 | 11/11 — counter = 200 |
 | memory | 4 workers × 50 = 200 | 11/11 — counter = 200 |
 
 PostgreSQL concurrency is genuine: the pool hands `sql.begin()` a separate
 connection, so parallel commits truly contend on `SELECT … FOR UPDATE`. Redis
-uses one injected client per writer, so the `WATCH`/`MULTI`/`EXEC` optimistic
-loop faces real conflicts.
+runs all writers on **one shared client** — the real usage pattern — so the
+compare-and-set (`EVAL`) path faces real cross-writer conflicts on a single
+socket.
+
+# Guard gap fixed in 0.6.1
+
+0.6.0's guard ran Redis with **one client per writer**. Independent connections
+hid the actual defect: `WATCH/MULTI/EXEC` state is per-connection, so it only
+corrupts under a *shared* connection — exactly the documented usage pattern the
+per-writer guard never exercised. In production the collapse was total (N
+concurrent `+1` → final value 1, not merely a few lost updates). 0.6.1 replaces
+`WATCH/MULTI/EXEC` with a server-side compare-and-set (`EVAL`) and the guard now
+runs on a **single shared client**, reproducing the failing pattern; it passes
+at 200/200 on both Redis backends.
 
 # Method
 
@@ -51,4 +65,5 @@ Each script exits non-zero on any failed check (CI-friendly).
 
 [1] `packages/krules/src/subject/batch.ts` — implementation under test.
 [2] `packages/krules/src/storage/apply-changes.ts` — shared resolution logic.
-[3] `test-batch-shared.ts` and `test-batch-atomic-{memory,bun-postgres,postgres,bun-redis,redis}.ts` (monorepo root).
+[3] `packages/krules/src/storage/redis-cas.ts` — shared Redis compare-and-set (EVAL) logic.
+[4] `test-batch-shared.ts` and `test-batch-atomic-{memory,bun-postgres,postgres,bun-redis,redis}.ts` (monorepo root).
