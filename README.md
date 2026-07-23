@@ -58,7 +58,7 @@ Avoid race conditions with callable updates, ensuring data consistency even unde
 await user.set('visits', (current) => (current || 0) + 1)
 ```
 
-The callback receives the current value and returns the new value. The entire read-modify-write cycle is atomic, protected by optimistic locking (Redis `WATCH/MULTI/EXEC`) or transactions (PostgreSQL `SELECT FOR UPDATE`).
+The callback receives the current value and returns the new value. The entire read-modify-write cycle is atomic, protected by a server-side compare-and-set (Redis `EVAL` Lua script) or transactions (PostgreSQL `SELECT FOR UPDATE`).
 
 ## Subject API
 
@@ -112,10 +112,10 @@ await user.batch()
 ```
 
 Callable values work inside a batch too, and their read-modify-write is
-**atomic against concurrent writers**: the callback is resolved by the storage
-backend inside the same locked transaction that persists the batch
-(PostgreSQL `SELECT FOR UPDATE`, Redis `WATCH/MULTI/EXEC`), not against an
-earlier snapshot.
+**atomic against concurrent writers**: the callback is resolved and applied by
+the storage backend atomically, not against an earlier snapshot — PostgreSQL
+inside a `SELECT FOR UPDATE` transaction, Redis via a server-side compare-and-set
+(`EVAL` Lua script).
 
 ```typescript
 await user.batch()
@@ -485,16 +485,20 @@ const bunRedisFactory = createBunRedisStorage({
 })
 ```
 
-> Idempotent operations (`get`/`set`/`delete`/`store`) retry freely after a
-> rebuild. Atomic callable values (`set(prop, old => ...)`, which use
-> `WATCH/MULTI/EXEC`) are non-idempotent by design, so they are retried **only**
-> when the failure provably occurred *before* `EXEC` was dispatched (nothing
-> could have committed — this safely covers the stale/dead cached-client case).
-> Once `EXEC` is in flight the commit outcome is ambiguous (a lost ack looks the
-> same whether the server committed or died first), so the operation **fails
-> loudly** rather than risk double-applying the callable — regardless of whether
-> the failure is a timeout or a connection error. The per-operation timeout is a
-> nuisance-failure guard, never a correctness mechanism for this decision.
+> Idempotent operations (`get`, non-callable `set`, `delete`, `has`, `keys`,
+> `load`) retry freely after a rebuild. Atomic callable values
+> (`set(prop, old => ...)` and batch `store()` carrying callables), which use a
+> server-side compare-and-set `EVAL` script, are non-idempotent by design, so
+> they are retried **only** when the failure provably occurred *before* `EVAL`
+> was dispatched (nothing could have committed — this safely covers the
+> stale/dead cached-client case). Once `EVAL` is in flight the commit outcome is
+> ambiguous (a lost ack looks the same whether the server committed or died
+> first), so the operation **fails loudly** rather than risk double-applying the
+> callable — regardless of whether the failure is a timeout or a connection
+> error. A CAS conflict (`EVAL` returned `0`, nothing written) is different: it
+> committed nothing, so it is safely re-read, recomputed and retried. The
+> per-operation timeout is a nuisance-failure guard, never a correctness
+> mechanism for this decision.
 
 An injected `client` is treated as caller-owned (like the ioredis adapter): it is
 never rebuilt, only the per-operation timeout applies.

@@ -65,6 +65,7 @@ is a hang, not an error, so error-detection alone would never trigger recovery.
 | `maxRetries` | number | `20` | Native reconnect budget; the rebuild layer is the real guarantee. |
 | `enableOfflineQueue` | boolean | `false` | Fail fast during an outage instead of queueing (which can hang). |
 | `operationTimeoutMs` | number | `3000` | Guards against half-open/frozen connections that never error. |
+| `atomicMaxRetries` | number | `100` | Max compare-and-set attempts for an atomic RMW before failing under sustained same-property contention. |
 
 # Retry safety
 
@@ -72,21 +73,30 @@ is a hang, not an error, so error-detection alone would never trigger recovery.
   `load`) are retried freely after a rebuild — last write wins.
 - Atomic callable values — immediate `set(prop, old => ...)` **and batch
   `store()` carrying callables** (see [Subject batch API](subject-batch-atomic.md))
-  — run under `WATCH/MULTI/EXEC` and are non-idempotent by design, so an
-  automatic retry must never risk re-applying the callable. The attempt tracks
-  whether `EXEC` was dispatched:
-  - Failure **before** `EXEC` (WATCH/HGET/MULTI/HSET error or timeout) → nothing
-    could have committed → safe transparent retry once (covers the stale/dead
-    cached-client case).
-  - Failure **at/after** `EXEC` → commit outcome is ambiguous (a lost ack is
+  — are applied with a **server-side compare-and-set** Lua script (`EVAL`; shared
+  with the ioredis backend in `krules/storage/redis-cas`). They are
+  non-idempotent by design, so an automatic retry must never risk re-applying the
+  callable. The attempt tracks whether `EVAL` was dispatched:
+  - Failure **before** `EVAL` (HGET/HMGET error or timeout) → nothing could have
+    committed → safe transparent retry once (covers the stale/dead cached-client
+    case).
+  - Failure **at/after** `EVAL` → commit outcome is ambiguous (a lost ack is
     indistinguishable from a pre-commit death), so **fail loudly** — no retry,
     for both timeouts and connection errors. The client is still healed for
     subsequent operations.
-  - `EXEC` returning `null` (WATCH conflict) is a provable abort → the optimistic
-    lock retries the WATCH loop.
+  - `EVAL` returning `0` (CAS mismatch — a concurrent writer won) is a provable
+    abort: nothing was written, so the storage layer re-reads, recomputes and
+    retries with a jittered backoff, up to `atomicMaxRetries` (default 100).
   A per-operation timeout is a nuisance-failure guard, not a correctness
   mechanism for this decision.
 - An injected `client` is treated as caller-owned and is never rebuilt.
+
+**Why compare-and-set, not `WATCH/MULTI/EXEC` (0.6.1 fix).** 0.6.0 used
+`WATCH/MULTI/EXEC`, whose state is **per-connection**; because this backend caches
+one client per URL, every subject shares it, and concurrent atomic operations on
+that shared connection interleaved and corrupted each other (isolation collapsed
+under concurrency — N concurrent `+1` → final value 1). `EVAL` runs atomically
+server-side as a single command, immune to that interleaving.
 
 # Validation
 
@@ -97,4 +107,5 @@ verified empirically — see
 # Citations
 
 [1] `packages/krules/src/storage/bun-redis.ts`
-[2] `packages/krules/README.md` — "High Performance with Bun Native Drivers" › "Connection resilience"
+[2] `packages/krules/src/storage/redis-cas.ts` — shared compare-and-set (EVAL) logic
+[3] `packages/krules/README.md` — "High Performance with Bun Native Drivers" › "Connection resilience"

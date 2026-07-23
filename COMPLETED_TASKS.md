@@ -43,3 +43,18 @@ Make callable read-modify-write inside `batch().commit()` atomic against concurr
 - Updated `README.md` (Batch Operations now documents atomic callable RMW) and synced the `.okf/` bundle (new batch + validation concepts, updated both Redis concepts, refreshed indexes/log; `validate --strict` clean).
 - Verified across all five backends with standalone Bun scripts in the monorepo root (`test-batch-shared.ts` + `test-batch-atomic-*.ts`): 11/11 each, including a concurrency guard (Postgres 8×25=200 over pooled `FOR UPDATE` connections; Redis 4×25=100 over independent `WATCH` clients; memory 4×50=200) with zero lost updates.
 - Bumped package version `0.5.0` → `0.6.0` and published `krules@0.6.0` to npm.
+
+## Redis atomic RMW: compare-and-set instead of WATCH/MULTI/EXEC
+
+**Date:** 2026-07-23
+**Branch:** `feature/caveat-su-batch-api`
+
+Fix a regression in the 0.6.0 Redis path found during production rollout: atomic read-modify-write collapsed under concurrency on a shared connection. The 0.6.0 code ran `WATCH/MULTI/EXEC` on the single shared client (ioredis is one socket; the Bun backend caches one client per URL). That state is per-connection, so concurrent operations on one socket interleaved between `await`s and isolation broke completely — N concurrent `+1` updates on one property landed a final value of 1, not N. Postgres (pooled `SELECT … FOR UPDATE`) was unaffected. The 0.6.0 concurrency guard missed it because it used one client *per writer*; independent connections never exercise the shared-connection failure.
+
+**What was done:**
+- Added `src/storage/redis-cas.ts`: a shared server-side compare-and-set Lua script (`EVAL`) plus helpers, the Redis analogue of `apply-changes.ts`. `EVAL` runs the whole script atomically server-side as a single command, so it is correct on a shared connection and across processes. The callable is computed client-side; the script CAS-guards only callable-derived fields (concrete sets/deletes stay unconditional, matching immediate mode) and returns a conflict on mismatch.
+- Rewrote the atomic paths in `src/storage/redis.ts` (ioredis) and `src/storage/bun-redis.ts` (Bun native) — both immediate `setAtomic` and batch `store()` — to read, compute, then apply via `EVAL`/CAS with an internal retry loop (jittered backoff, bounded by the new `atomicMaxRetries` option, default 100). The application never sees a conflict. Bun-native keeps its timeout/rebuild resilience and the "don't retry after dispatch" guard (now keyed on `EVAL` dispatch); a CAS conflict is always safe to retry.
+- Reworked the concurrency guard to run on a **single shared client** (the real usage pattern that exposed the bug) — 8 writers × 25 = 200 on one property, for both Redis backends.
+- Updated `README.md` (three Redis atomicity references now describe the `EVAL` CAS) and synced the `.okf/` bundle (both Redis concepts, the batch concept's locking table, and the validation concept with a guard-gap note; `validate --strict` clean).
+- Verified locally against real Redis and Postgres: 11/11 on all five backends, including the shared-client Redis guard now closing at 200/200 (the exact scenario that produced 1 before the fix). Fix confirmed in the reported production case.
+- Bumped package version `0.6.0` → `0.6.1` and published `krules@0.6.1` to npm.

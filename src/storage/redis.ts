@@ -2,7 +2,9 @@
  * RedisStorage - Redis-backed storage for krules.ts
  *
  * Stores subject properties in Redis hashes.
- * Supports atomic operations via WATCH/MULTI/EXEC for callable values.
+ * Atomic read-modify-write for callable values uses a server-side
+ * compare-and-set Lua script (EVAL) — see {@link file://./redis-cas.ts} for why
+ * WATCH/MULTI/EXEC is unsafe on the shared connection this backend uses.
  *
  * @example
  * import Redis from 'ioredis'
@@ -15,7 +17,13 @@
  */
 
 import type { Storage, StorageChanges, StoreResult, SetResult, DeleteResult, StorageFactory } from './types'
-import { applyChanges } from './apply-changes'
+import {
+  CAS_APPLY_SCRIPT,
+  buildCasArgs,
+  casApplied,
+  casBackoffMs,
+  prepareStore,
+} from './redis-cas'
 
 // ioredis types - imported dynamically to keep it optional
 type RedisClient = {
@@ -27,9 +35,8 @@ type RedisClient = {
   hexists(key: string, field: string): Promise<number>
   hkeys(key: string): Promise<string[]>
   hgetall(key: string): Promise<Record<string, string>>
+  eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown>
   del(key: string): Promise<number>
-  watch(key: string): Promise<'OK'>
-  unwatch(): Promise<'OK'>
   multi(): RedisMulti
   duplicate(): RedisClient
   quit(): Promise<'OK'>
@@ -48,6 +55,13 @@ export interface RedisStorageOptions {
   client: RedisClient
   /** Key prefix for all subjects (e.g., 'myapp:subjects:') */
   prefix?: string
+  /**
+   * Max attempts for an atomic read-modify-write before giving up under
+   * sustained contention on the same property. Each retry re-reads, recomputes
+   * the callable and re-applies the compare-and-set, with a small jittered
+   * backoff. Default: 100.
+   */
+  atomicMaxRetries?: number
 }
 
 /**
@@ -58,6 +72,7 @@ export class RedisStorage implements Storage {
   private readonly client: RedisClient
   private readonly prefix: string
   private readonly hashKey: string
+  private readonly atomicMaxRetries: number
 
   constructor(
     public readonly subjectName: string,
@@ -66,6 +81,7 @@ export class RedisStorage implements Storage {
     this.client = options.client
     this.prefix = options.prefix ?? 'krules:'
     this.hashKey = `${this.prefix}${subjectName}`
+    this.atomicMaxRetries = options.atomicMaxRetries ?? 100
   }
 
   /**
@@ -76,10 +92,17 @@ export class RedisStorage implements Storage {
   }
 
   /**
-   * Redis storage is concurrency-safe via WATCH/MULTI/EXEC.
+   * Redis storage is concurrency-safe: atomic read-modify-write uses a
+   * server-side compare-and-set (EVAL), which is correct even on the single
+   * shared connection this backend uses and across processes.
    */
   isConcurrencySafe(): boolean {
     return true
+  }
+
+  /** Run the shared CAS Lua script on this subject's hash. */
+  private evalCas(args: string[]): Promise<unknown> {
+    return this.client.eval(CAS_APPLY_SCRIPT, 1, this.hashKey, ...args)
   }
 
   // ============================================
@@ -117,55 +140,43 @@ export class RedisStorage implements Storage {
   }
 
   /**
-   * Atomic set with optimistic locking for callable values.
-   * Retries on conflict (WatchError).
+   * Atomic set with optimistic compare-and-set for callable values.
+   * Reads the value, computes the callable, then applies it only if the field
+   * still holds what we read (server-side CAS). Retries on conflict.
    */
   private async setAtomic(
     property: string,
     fn: (old: unknown) => unknown
   ): Promise<SetResult> {
-    const maxRetries = 10
-    let retries = 0
+    for (let attempt = 0; attempt < this.atomicMaxRetries; attempt++) {
+      // Read the raw stored string; it doubles as the CAS "expected" value.
+      const raw = await this.client.hget(this.hashKey, property)
+      const parsedOldValue = raw != null ? JSON.parse(raw) : undefined
 
-    while (retries < maxRetries) {
-      try {
-        // Watch the hash key for changes
-        await this.client.watch(this.hashKey)
+      // Snapshot oldValue BEFORE the closure runs, so in-place mutation
+      // doesn't make oldValue === newValue (reference comparison)
+      const oldValue = parsedOldValue != null && typeof parsedOldValue === 'object'
+        ? structuredClone(parsedOldValue)
+        : parsedOldValue
 
-        // Get current value
-        const oldValueRaw = await this.client.hget(this.hashKey, property)
-        const parsedOldValue = oldValueRaw ? JSON.parse(oldValueRaw) : undefined
+      const newValue = fn(parsedOldValue)
 
-        // Snapshot oldValue BEFORE the closure runs, so in-place mutation
-        // doesn't make oldValue === newValue (reference comparison)
-        const oldValue = parsedOldValue != null && typeof parsedOldValue === 'object'
-          ? structuredClone(parsedOldValue)
-          : parsedOldValue
+      const args = buildCasArgs({
+        checks: [{ field: property, present: raw != null, expected: raw ?? '' }],
+        sets: [[property, JSON.stringify(newValue)]],
+        deletes: [],
+      })
 
-        // Compute new value
-        const newValue = fn(parsedOldValue)
-
-        // Execute transaction
-        const pipeline = this.client.multi()
-        pipeline.hset(this.hashKey, property, JSON.stringify(newValue))
-
-        const results = await pipeline.exec()
-
-        // If results is null, another client modified the key (WatchError)
-        if (results === null) {
-          retries++
-          continue
-        }
-
+      if (casApplied(await this.evalCas(args))) {
         return { newValue, oldValue }
-      } catch (error) {
-        // Unwatch and rethrow
-        await this.client.unwatch()
-        throw error
       }
+
+      // CAS mismatch: a concurrent writer won. Back off and retry.
+      const delay = casBackoffMs(attempt)
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay))
     }
 
-    throw new Error(`Redis atomic set failed after ${maxRetries} retries`)
+    throw new Error(`Redis atomic set failed after ${this.atomicMaxRetries} retries`)
   }
 
   async delete(property: string): Promise<DeleteResult> {
@@ -208,58 +219,34 @@ export class RedisStorage implements Storage {
       return { changed: [], deleted: [] }
     }
 
-    // Callables in a batch make the write non-idempotent, so it must be
-    // serialized with WATCH/MULTI/EXEC and retried on conflict (WatchError).
-    const maxRetries = 10
-    let retries = 0
+    // Read the referenced fields, compute callables, then apply through a
+    // server-side compare-and-set. Only callable-derived fields are CAS-guarded,
+    // so a batch with no callables applies in one shot (never conflicts).
+    const referenced = [
+      ...new Set([...changes.sets.map(([p]) => p), ...changes.deletes]),
+    ]
 
-    while (retries < maxRetries) {
-      try {
-        await this.client.watch(this.hashKey)
-
-        // Read only the properties referenced by this batch.
-        const referenced = [
-          ...new Set([...changes.sets.map(([p]) => p), ...changes.deletes]),
-        ]
-        const current: Record<string, unknown> = {}
-        if (referenced.length > 0) {
-          const raw = await this.client.hmget(this.hashKey, ...referenced)
-          referenced.forEach((property, i) => {
-            const value = raw[i]
-            if (value != null) current[property] = JSON.parse(value)
-          })
-        }
-
-        const { newProperties, result } = applyChanges(current, changes)
-
-        const pipeline = this.client.multi()
-        const toSet: Record<string, string> = {}
-        for (const [property] of changes.sets) {
-          toSet[property] = JSON.stringify(newProperties[property])
-        }
-        if (Object.keys(toSet).length > 0) {
-          pipeline.hset(this.hashKey, toSet)
-        }
-        if (changes.deletes.length > 0) {
-          pipeline.hdel(this.hashKey, ...changes.deletes)
-        }
-
-        const results = await pipeline.exec()
-
-        // null => another client modified the watched key (WatchError), retry.
-        if (results === null) {
-          retries++
-          continue
-        }
-
-        return result
-      } catch (error) {
-        await this.client.unwatch()
-        throw error
+    for (let attempt = 0; attempt < this.atomicMaxRetries; attempt++) {
+      const rawByField: Record<string, string | null> = {}
+      if (referenced.length > 0) {
+        const raw = await this.client.hmget(this.hashKey, ...referenced)
+        referenced.forEach((property, i) => {
+          rawByField[property] = raw[i] ?? null
+        })
       }
+
+      const { program, result } = prepareStore(changes, rawByField)
+
+      if (casApplied(await this.evalCas(buildCasArgs(program)))) {
+        return result
+      }
+
+      // CAS mismatch on a callable field: re-read, recompute and retry.
+      const delay = casBackoffMs(attempt)
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay))
     }
 
-    throw new Error(`Redis batch store failed after ${maxRetries} retries`)
+    throw new Error(`Redis batch store failed after ${this.atomicMaxRetries} retries`)
   }
 
   // ============================================

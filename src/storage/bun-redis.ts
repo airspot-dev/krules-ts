@@ -4,8 +4,10 @@
  * Uses Bun's built-in RedisClient for maximum performance.
  * No external dependencies required.
  *
- * Note: Atomic operations (callable values) use raw WATCH/MULTI/EXEC
- * commands since Bun's Redis client doesn't have native transaction support.
+ * Note: atomic read-modify-write for callable values uses a server-side
+ * compare-and-set Lua script (EVAL) — see {@link file://./redis-cas.ts} for why
+ * WATCH/MULTI/EXEC is unsafe on the shared (per-URL cached) connection this
+ * backend uses.
  *
  * ## Connection resilience
  *
@@ -36,7 +38,13 @@
  */
 
 import type { Storage, StorageChanges, StoreResult, SetResult, DeleteResult, StorageFactory } from './types'
-import { applyChanges } from './apply-changes'
+import {
+  CAS_APPLY_SCRIPT,
+  buildCasArgs,
+  casApplied,
+  casBackoffMs,
+  prepareStore,
+} from './redis-cas'
 
 // Bun's native Redis client type
 type BunRedisClient = {
@@ -88,6 +96,13 @@ export interface BunRedisStorageOptions {
    * the client is evicted and rebuilt. Default: 3000.
    */
   operationTimeoutMs?: number
+  /**
+   * Max attempts for an atomic read-modify-write before giving up under
+   * sustained contention on the same property. Each retry re-reads, recomputes
+   * the callable and re-applies the compare-and-set, with a small jittered
+   * backoff. Default: 100.
+   */
+  atomicMaxRetries?: number
 }
 
 // Shared client per URL to avoid connection overhead. Stores the in-flight
@@ -196,6 +211,7 @@ export class BunRedisStorage implements Storage {
   private readonly injectedClient: BunRedisClient | null
   private readonly clientOptions: ResolvedClientOptions
   private readonly operationTimeoutMs: number
+  private readonly atomicMaxRetries: number
 
   constructor(
     public readonly subjectName: string,
@@ -204,6 +220,7 @@ export class BunRedisStorage implements Storage {
     this.prefix = options.prefix ?? 'krules:'
     this.hashKey = `${this.prefix}${subjectName}`
     this.operationTimeoutMs = options.operationTimeoutMs ?? 3000
+    this.atomicMaxRetries = options.atomicMaxRetries ?? 100
 
     this.clientOptions = {
       autoReconnect: options.autoReconnect ?? true,
@@ -276,7 +293,7 @@ export class BunRedisStorage implements Storage {
   }
 
   async set(property: string, value: unknown): Promise<SetResult> {
-    // Handle callable values with atomic WATCH/MULTI/EXEC
+    // Handle callable values with atomic compare-and-set
     if (typeof value === 'function') {
       return this.setAtomic(property, value as (old: unknown) => unknown)
     }
@@ -293,40 +310,41 @@ export class BunRedisStorage implements Storage {
   }
 
   /**
-   * Atomic set with optimistic locking for callable values.
-   * Uses raw WATCH/MULTI/EXEC commands.
+   * Atomic set with optimistic compare-and-set for callable values.
    *
    * Resilience note: callable values are non-idempotent by design (their whole
    * purpose is a race-free read-modify-write of an existing value), so an
    * automatic retry must never risk re-applying `fn`. A failure is safe to retry
-   * ONLY when it provably happened *before* EXEC was sent — nothing could have
-   * committed. Once EXEC is in flight the commit outcome is ambiguous (a lost
-   * ack looks identical whether the server committed or died first), regardless
-   * of whether the failure surfaces as a connection error or a timeout, so we
-   * fail loudly instead of retrying. The client is still healed for subsequent
-   * operations. A per-operation timeout is a nuisance-failure guard, never a
-   * correctness mechanism for this decision.
+   * ONLY when it provably happened *before* the EVAL was dispatched — nothing
+   * could have committed. Once EVAL is in flight the commit outcome is ambiguous
+   * (a lost ack looks identical whether the server committed or died first),
+   * regardless of whether the failure surfaces as a connection error or a
+   * timeout, so we fail loudly instead of retrying. The client is still healed
+   * for subsequent operations. A per-operation timeout is a nuisance-failure
+   * guard, never a correctness mechanism for this decision.
+   *
+   * A CAS *conflict* (EVAL returned 0 — nothing written) is different: it
+   * provably committed nothing, so it is safe to re-read, recompute and retry.
    */
   private async setAtomic(
     property: string,
     fn: (old: unknown) => unknown
   ): Promise<SetResult> {
-    const maxConflictRetries = 10
-    let conflicts = 0
-    let rebuiltBeforeExec = false
+    let rebuiltBeforeEval = false
 
-    while (conflicts < maxConflictRetries) {
+    for (let attempt = 0; attempt < this.atomicMaxRetries; attempt++) {
       const client = await this.currentClient()
-      // Flag flips to true the instant EXEC is dispatched; after that a failure
+      // Flag flips to true the instant EVAL is dispatched; after that a failure
       // has an ambiguous commit outcome and must not be retried.
-      const state = { execDispatched: false }
+      const state = { evalDispatched: false }
       try {
         const outcome = await withTimeout(
           this.atomicAttempt(client, property, fn, state),
           this.operationTimeoutMs,
         )
         if (outcome === 'conflict') {
-          conflicts++
+          const delay = casBackoffMs(attempt)
+          if (delay > 0) await new Promise((r) => setTimeout(r, delay))
           continue
         }
         return outcome
@@ -336,71 +354,58 @@ export class BunRedisStorage implements Storage {
         if (this.injectedClient === null) await evictIfCurrent(this.url!, client)
 
         const recoverable = isTimeoutError(err) || isConnectionError(err)
-        const provablyNotCommitted = !state.execDispatched
+        const provablyNotCommitted = !state.evalDispatched
 
-        // Transparent retry ONLY when the failure provably occurred before EXEC
+        // Transparent retry ONLY when the failure provably occurred before EVAL
         // (covers the stale/dead cached-client case safely). Otherwise fail loud.
-        if (this.injectedClient === null && recoverable && provablyNotCommitted && !rebuiltBeforeExec) {
-          rebuiltBeforeExec = true
+        if (this.injectedClient === null && recoverable && provablyNotCommitted && !rebuiltBeforeEval) {
+          rebuiltBeforeEval = true
           continue
         }
         throw err
       }
     }
 
-    throw new Error(`Redis atomic set failed after ${maxConflictRetries} retries`)
+    throw new Error(`Redis atomic set failed after ${this.atomicMaxRetries} retries`)
   }
 
   /**
-   * A single WATCH/MULTI/EXEC attempt. Returns 'conflict' if another client won.
-   * Sets `state.execDispatched` immediately before sending EXEC so the caller
-   * can tell a provably-not-committed failure from an ambiguous one.
+   * A single compare-and-set attempt. Reads the value, computes the callable,
+   * then applies it via EVAL only if the field still holds what we read. Returns
+   * 'conflict' if a concurrent writer won. Sets `state.evalDispatched`
+   * immediately before sending EVAL so the caller can tell a
+   * provably-not-committed failure from an ambiguous one.
    */
   private async atomicAttempt(
     client: BunRedisClient,
     property: string,
     fn: (old: unknown) => unknown,
-    state: { execDispatched: boolean }
+    state: { evalDispatched: boolean }
   ): Promise<SetResult | 'conflict'> {
-    // Watch the hash key for changes
-    await client.send('WATCH', [this.hashKey])
+    // Read the raw stored string; it doubles as the CAS "expected" value.
+    const raw = (await client.send('HGET', [this.hashKey, property])) as string | null
+    const parsedOldValue = raw != null ? JSON.parse(raw) : undefined
 
-    try {
-      // Get current value
-      const oldValueRaw = await client.send('HGET', [this.hashKey, property]) as string | null
-      const parsedOldValue = oldValueRaw ? JSON.parse(oldValueRaw) : undefined
+    // Snapshot oldValue BEFORE the closure runs, so in-place mutation
+    // doesn't make oldValue === newValue (reference comparison)
+    const oldValue = parsedOldValue != null && typeof parsedOldValue === 'object'
+      ? structuredClone(parsedOldValue)
+      : parsedOldValue
 
-      // Snapshot oldValue BEFORE the closure runs, so in-place mutation
-      // doesn't make oldValue === newValue (reference comparison)
-      const oldValue = parsedOldValue != null && typeof parsedOldValue === 'object'
-        ? structuredClone(parsedOldValue)
-        : parsedOldValue
+    const newValue = fn(parsedOldValue)
 
-      // Compute new value
-      const newValue = fn(parsedOldValue)
+    const args = buildCasArgs({
+      checks: [{ field: property, present: raw != null, expected: raw ?? '' }],
+      sets: [[property, JSON.stringify(newValue)]],
+      deletes: [],
+    })
 
-      // Start transaction
-      await client.send('MULTI', [])
+    // From here the commit outcome is ambiguous on failure: mark it before the
+    // EVAL round-trip so the caller never retries a possibly-committed op.
+    state.evalDispatched = true
+    const result = await client.send('EVAL', [CAS_APPLY_SCRIPT, 1, this.hashKey, ...args])
 
-      // Queue the HSET command
-      await client.send('HSET', [this.hashKey, property, JSON.stringify(newValue)])
-
-      // From here the commit outcome is ambiguous on failure: mark it before
-      // the EXEC round-trip so the caller never retries a possibly-committed op.
-      state.execDispatched = true
-      const result = await client.send('EXEC', [])
-
-      // If result is null, another client modified the key (provably aborted).
-      if (result === null) {
-        return 'conflict'
-      }
-
-      return { newValue, oldValue }
-    } catch (error) {
-      // Unwatch and rethrow
-      await client.send('DISCARD', []).catch(() => {})
-      throw error
-    }
+    return casApplied(result) ? { newValue, oldValue } : 'conflict'
   }
 
   async delete(property: string): Promise<DeleteResult> {
@@ -454,24 +459,26 @@ export class BunRedisStorage implements Storage {
       return { changed: [], deleted: [] }
     }
 
-    // Callables in a batch make the write non-idempotent (their whole purpose
-    // is a race-free read-modify-write), so the batch must be serialized with
-    // WATCH/MULTI/EXEC. Same resilience model as setAtomic: retry only when the
-    // failure provably occurred before EXEC.
-    const maxConflictRetries = 10
-    let conflicts = 0
-    let rebuiltBeforeExec = false
+    // Read the referenced fields, compute callables, then apply through a
+    // server-side compare-and-set. Same resilience model as setAtomic: on a
+    // connection failure, retry only when it provably occurred before EVAL; a
+    // CAS conflict (nothing written) is always safe to re-read and retry.
+    const referenced = [
+      ...new Set([...changes.sets.map(([p]) => p), ...changes.deletes]),
+    ]
+    let rebuiltBeforeEval = false
 
-    while (conflicts < maxConflictRetries) {
+    for (let attempt = 0; attempt < this.atomicMaxRetries; attempt++) {
       const client = await this.currentClient()
-      const state = { execDispatched: false }
+      const state = { evalDispatched: false }
       try {
         const outcome = await withTimeout(
-          this.storeAttempt(client, changes, state),
+          this.storeAttempt(client, changes, referenced, state),
           this.operationTimeoutMs,
         )
         if (outcome === 'conflict') {
-          conflicts++
+          const delay = casBackoffMs(attempt)
+          if (delay > 0) await new Promise((r) => setTimeout(r, delay))
           continue
         }
         return outcome
@@ -479,73 +486,54 @@ export class BunRedisStorage implements Storage {
         if (this.injectedClient === null) await evictIfCurrent(this.url!, client)
 
         const recoverable = isTimeoutError(err) || isConnectionError(err)
-        const provablyNotCommitted = !state.execDispatched
+        const provablyNotCommitted = !state.evalDispatched
 
-        if (this.injectedClient === null && recoverable && provablyNotCommitted && !rebuiltBeforeExec) {
-          rebuiltBeforeExec = true
+        if (this.injectedClient === null && recoverable && provablyNotCommitted && !rebuiltBeforeEval) {
+          rebuiltBeforeEval = true
           continue
         }
         throw err
       }
     }
 
-    throw new Error(`Redis batch store failed after ${maxConflictRetries} retries`)
+    throw new Error(`Redis batch store failed after ${this.atomicMaxRetries} retries`)
   }
 
   /**
-   * A single WATCH/MULTI/EXEC attempt for a batch store. Reads the referenced
-   * fields under WATCH, resolves callables, queues HSET/HDEL, then EXECs.
-   * Returns 'conflict' if another client modified the key first.
+   * A single compare-and-set attempt for a batch store. Reads the referenced
+   * fields, resolves callables, then applies HSET/HDEL via EVAL only if every
+   * callable-derived field still holds what we read. Returns 'conflict' if a
+   * concurrent writer won. Sets `state.evalDispatched` immediately before
+   * sending EVAL so the caller can tell a provably-not-committed failure from an
+   * ambiguous one.
    */
   private async storeAttempt(
     client: BunRedisClient,
     changes: StorageChanges,
-    state: { execDispatched: boolean }
+    referenced: string[],
+    state: { evalDispatched: boolean }
   ): Promise<StoreResult | 'conflict'> {
-    await client.send('WATCH', [this.hashKey])
-
-    try {
-      // Read only the properties referenced by this batch.
-      const referenced = [
-        ...new Set([...changes.sets.map(([p]) => p), ...changes.deletes]),
-      ]
-      const current: Record<string, unknown> = {}
-      if (referenced.length > 0) {
-        const raw = (await client.send('HMGET', [this.hashKey, ...referenced])) as (string | null)[]
-        referenced.forEach((property, i) => {
-          const value = raw[i]
-          if (value != null) current[property] = JSON.parse(value)
-        })
-      }
-
-      const { newProperties, result } = applyChanges(current, changes)
-
-      await client.send('MULTI', [])
-
-      const toSet: string[] = []
-      for (const [property] of changes.sets) {
-        toSet.push(property, JSON.stringify(newProperties[property]))
-      }
-      if (toSet.length > 0) {
-        await client.send('HSET', [this.hashKey, ...toSet])
-      }
-      if (changes.deletes.length > 0) {
-        await client.send('HDEL', [this.hashKey, ...changes.deletes])
-      }
-
-      state.execDispatched = true
-      const execResult = await client.send('EXEC', [])
-
-      // null EXEC => another client modified the watched key (provably aborted).
-      if (execResult === null) {
-        return 'conflict'
-      }
-
-      return result
-    } catch (error) {
-      await client.send('DISCARD', []).catch(() => {})
-      throw error
+    const rawByField: Record<string, string | null> = {}
+    if (referenced.length > 0) {
+      const raw = (await client.send('HMGET', [this.hashKey, ...referenced])) as (string | null)[]
+      referenced.forEach((property, i) => {
+        rawByField[property] = raw[i] ?? null
+      })
     }
+
+    const { program, result } = prepareStore(changes, rawByField)
+
+    // From here the commit outcome is ambiguous on failure: mark it before the
+    // EVAL round-trip so the caller never retries a possibly-committed op.
+    state.evalDispatched = true
+    const execResult = await client.send('EVAL', [
+      CAS_APPLY_SCRIPT,
+      1,
+      this.hashKey,
+      ...buildCasArgs(program),
+    ])
+
+    return casApplied(execResult) ? result : 'conflict'
   }
 
   // ============================================

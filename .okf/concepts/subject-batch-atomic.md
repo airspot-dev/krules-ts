@@ -58,11 +58,25 @@ identical.
 | Backend | Batch lock |
 |---------|-----------|
 | PostgreSQL — Bun ([bun-postgres]) and node (`postgres`) | `SELECT … FOR UPDATE` inside `sql.begin()` |
-| Redis — Bun ([BunRedisStorage](storage-bun-redis.md)) and node ([RedisStorage](storage-redis-ioredis.md)) | `WATCH`/`MULTI`/`EXEC` optimistic loop with retry |
+| Redis — Bun ([BunRedisStorage](storage-bun-redis.md)) and node ([RedisStorage](storage-redis-ioredis.md)) | server-side compare-and-set (`EVAL`/Lua) with retry |
 | In-memory | single event loop, no lock needed |
 
 For a single-property atomic RMW without a batch, `set(prop, callable)` in
 immediate mode is atomic by the same mechanism.
+
+> **Redis mechanism (0.6.1)** — the Redis backends apply the RMW with a
+> server-side compare-and-set Lua script (`EVAL`), **not** `WATCH/MULTI/EXEC`.
+> 0.6.0 shipped the `WATCH/MULTI/EXEC` optimistic loop, but that state is
+> **per-connection** and both Redis backends use a *shared* connection (ioredis
+> is a single socket; the Bun backend caches one client per URL). Under
+> concurrent writers on that shared connection the transactions interleaved
+> between `await`s and isolation collapsed — N concurrent `+1` updates on one
+> property landing a final value of 1. `EVAL` runs the whole script atomically
+> server-side as a **single command**, immune to that interleaving: correct on a
+> shared connection and across processes. The callable is computed client-side,
+> then the script CAS-guards only the callable-derived fields (concrete sets /
+> deletes are unconditional) and retries on mismatch. Shared logic lives in
+> `krules/storage/redis-cas`. See the two Redis backend concepts for detail.
 
 # Validation
 
@@ -74,6 +88,7 @@ Verified across all five backends — see
 [1] `packages/krules/src/subject/batch.ts`
 [2] `packages/krules/src/storage/types.ts` — `StorageChanges`, `StoreResult`, `Storage.store()`
 [3] `packages/krules/src/storage/apply-changes.ts` — shared resolution logic
-[4] `packages/krules/README.md` — "Batch Operations"
+[4] `packages/krules/src/storage/redis-cas.ts` — shared Redis compare-and-set (EVAL) logic
+[5] `packages/krules/README.md` — "Batch Operations"
 
 [bun-postgres]: krules/storage/bun-postgres
