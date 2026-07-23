@@ -35,7 +35,8 @@
  * })
  */
 
-import type { Storage, StorageChanges, SetResult, DeleteResult, StorageFactory } from './types'
+import type { Storage, StorageChanges, StoreResult, SetResult, DeleteResult, StorageFactory } from './types'
+import { applyChanges } from './apply-changes'
 import {
   applySchemaCustomization,
   type ResolvedComputedColumn,
@@ -411,38 +412,28 @@ export class BunPostgresStorage implements Storage {
     return this.parseProperties(rows[0]?.properties)
   }
 
-  async store(changes: StorageChanges): Promise<void> {
-    if (changes.inserts.length === 0 && changes.updates.length === 0 && changes.deletes.length === 0) {
-      return
+  async store(changes: StorageChanges): Promise<StoreResult> {
+    if (changes.sets.length === 0 && changes.deletes.length === 0) {
+      return { changed: [], deleted: [] }
     }
 
-    await this.sql.begin(async (tx: any) => {
-      // Get current properties
+    return this.sql.begin(async (tx: any) => {
+      // Lock the row and read current state. Callables are resolved against
+      // this locked snapshot, so batch read-modify-write is atomic inter-writer.
       const oldRows = await tx.unsafe(
         `SELECT "${this.propsCol}" as properties FROM ${this.fullTable} WHERE "${this.nameCol}" = $1 FOR UPDATE`,
         [this.subjectName]
       )
 
-      let newProperties = { ...this.parseProperties(oldRows[0]?.properties) }
-
-      // Apply inserts and updates
-      for (const [property, value] of changes.inserts) {
-        newProperties[property] = value
-      }
-
-      for (const [property, value] of changes.updates) {
-        newProperties[property] = value
-      }
-
-      // Apply deletes
-      for (const property of changes.deletes) {
-        delete newProperties[property]
-      }
+      const current = this.parseProperties(oldRows[0]?.properties)
+      const { newProperties, result } = applyChanges(current, changes)
 
       await tx.unsafe(
         this.upsertSql,
         [this.subjectName, JSON.stringify(newProperties), ...this.computedValues(newProperties)]
       )
+
+      return result
     })
   }
 

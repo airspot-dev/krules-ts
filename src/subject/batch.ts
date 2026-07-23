@@ -89,111 +89,73 @@ export class BatchBuilder {
       return
     }
 
-    // Load current state to track inserts vs updates
-    const current = await this.storage.load()
-
-    // Prepare storage changes
+    // Build storage changes. Callables are passed through UNRESOLVED — the
+    // backend resolves them under the lock, making batch read-modify-write
+    // atomic against concurrent writers. Insert-vs-update and existence are
+    // decided by the backend under the lock too.
     const storageChanges: StorageChanges = {
-      inserts: [],
-      updates: [],
+      sets: [],
       deletes: [],
     }
 
-    // Track events to emit after successful storage
-    const events: Array<{
-      type: 'changed' | 'deleted'
-      property: string
-      oldValue: unknown
-      newValue?: unknown
-      muted?: boolean
-      extra?: Record<string, unknown>
-    }> = []
-
-    // Process each change
     for (const [property, change] of this.changes) {
-      const oldValue = current[property]
-
       if (change.type === 'delete') {
-        if (property in current) {
-          storageChanges.deletes.push(property)
-          events.push({
-            type: 'deleted',
-            property,
-            oldValue,
-            muted: change.muted,
-            extra: change.extra,
-          })
-        }
+        storageChanges.deletes.push(property)
       } else {
-        // Resolve callable values
-        const isCallable = typeof change.value === 'function'
-        // Snapshot oldValue BEFORE the closure runs, so in-place mutation
-        // doesn't make oldValue === newValue (reference comparison)
-        const snapshotOldValue = isCallable && oldValue != null && typeof oldValue === 'object'
-          ? structuredClone(oldValue)
-          : oldValue
-        const newValue = isCallable
-          ? (change.value as (old: unknown) => unknown)(oldValue)
-          : change.value
-
-        // Determine insert vs update
-        if (property in current) {
-          storageChanges.updates.push([property, newValue])
-        } else {
-          storageChanges.inserts.push([property, newValue])
-        }
-
-        // Track event if value changed
-        if (newValue !== snapshotOldValue) {
-          events.push({
-            type: 'changed',
-            property,
-            oldValue: snapshotOldValue,
-            newValue,
-            muted: change.muted,
-            extra: change.extra,
-          })
-        }
+        storageChanges.sets.push([property, change.value])
       }
     }
 
-    // Persist all changes in single batch
-    await this.storage.store(storageChanges)
+    // Persist atomically. The backend returns the materialized old/new values
+    // computed under the lock, so we emit accurate per-property events.
+    const { changed, deleted } = await this.storage.store(storageChanges)
 
-    // Emit events after successful persistence
-    for (const event of events) {
-      if (event.muted) {
+    const changedByProperty = new Map(changed.map((c) => [c.property, c]))
+    const deletedByProperty = new Map(deleted.map((d) => [d.property, d]))
+
+    // Emit one event per property, after successful persistence, preserving the
+    // original queue order and the "only if changed / only if existed" rule.
+    for (const [property, change] of this.changes) {
+      if (change.muted) {
         continue
       }
 
-      if (event.type === 'changed') {
-        await this.eventBus.emit(
-          SubjectPropertyChanged,
-          this.subject,
-          {
-            propertyName: event.property,
-            oldValue: event.oldValue,
-            newValue: event.newValue,
-          },
-          event.extra,
-          {
-            propertyName: event.property,
-            oldValue: event.oldValue,
-            newValue: event.newValue,
-          }
-        )
-      } else {
+      if (change.type === 'delete') {
+        const d = deletedByProperty.get(property)
+        if (!d) {
+          continue
+        }
         await this.eventBus.emit(
           SubjectPropertyDeleted,
           this.subject,
           {
-            propertyName: event.property,
-            oldValue: event.oldValue,
+            propertyName: property,
+            oldValue: d.oldValue,
           },
-          event.extra,
+          change.extra,
           {
-            propertyName: event.property,
-            oldValue: event.oldValue,
+            propertyName: property,
+            oldValue: d.oldValue,
+          }
+        )
+      } else {
+        const c = changedByProperty.get(property)
+        if (!c) {
+          continue
+        }
+        await this.eventBus.emit(
+          SubjectPropertyChanged,
+          this.subject,
+          {
+            propertyName: property,
+            oldValue: c.oldValue,
+            newValue: c.newValue,
+          },
+          change.extra,
+          {
+            propertyName: property,
+            oldValue: c.oldValue,
+            newValue: c.newValue,
           }
         )
       }

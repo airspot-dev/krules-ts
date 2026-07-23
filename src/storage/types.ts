@@ -6,15 +6,31 @@
  */
 
 /**
- * Changes to be persisted in a batch operation
+ * Changes to be persisted in a batch operation.
+ *
+ * A `sets` value may be a concrete value OR a callable `(old) => new`.
+ * Callables are resolved by the backend INSIDE the locked transaction of
+ * `store()`, so a batch read-modify-write is serialized against concurrent
+ * writers (atomic RMW). The backend decides insert-vs-update and
+ * existence under the lock, so there is no separate insert/update split.
  */
 export interface StorageChanges {
-  /** New properties to insert */
-  inserts: Array<[property: string, value: unknown]>
-  /** Existing properties to update */
-  updates: Array<[property: string, value: unknown]>
+  /** Properties to set. Value may be a concrete value or a callable (old)=>new. */
+  sets: Array<[property: string, value: unknown]>
   /** Properties to delete */
   deletes: string[]
+}
+
+/**
+ * Result of a batch `store()` operation, reporting the materialized old/new
+ * values computed under the lock. Used by the caller to emit per-property
+ * change events after the transaction has committed.
+ */
+export interface StoreResult {
+  /** Properties whose value actually changed (newValue !== oldValue) */
+  changed: Array<{ property: string; oldValue: unknown; newValue: unknown }>
+  /** Properties that existed and were deleted */
+  deleted: Array<{ property: string; oldValue: unknown }>
 }
 
 /**
@@ -109,8 +125,12 @@ export interface Storage {
   /**
    * Persist multiple changes in a single batch operation.
    * Used by batch mode to commit all accumulated changes.
+   *
+   * Callable values in `changes.sets` are resolved under the lock, making
+   * batch read-modify-write atomic against concurrent writers. Returns the
+   * materialized old/new values so the caller can emit per-property events.
    */
-  store(changes: StorageChanges): Promise<void>
+  store(changes: StorageChanges): Promise<StoreResult>
 
   // ============================================
   // Cleanup

@@ -4,7 +4,7 @@ title: BunRedisStorage (Bun native Redis backend)
 description: Bun-native Redis storage backend for KRules subjects, with per-operation timeout and rebuild-on-failure connection resilience.
 resource: krules/storage/bun-redis
 tags: [storage, redis, bun, resilience]
-timestamp: 2026-07-11T09:30:00Z
+timestamp: 2026-07-23T00:00:00Z
 ---
 
 # Overview
@@ -69,10 +69,12 @@ is a hang, not an error, so error-detection alone would never trigger recovery.
 # Retry safety
 
 - Idempotent operations (`get`, non-callable `set`, `delete`, `has`, `keys`,
-  `load`, `store`) are retried freely after a rebuild — last write wins.
-- Atomic callable values (`set(prop, old => ...)`, via `WATCH/MULTI/EXEC`) are
-  non-idempotent by design, so an automatic retry must never risk re-applying
-  `fn`. The attempt tracks whether `EXEC` was dispatched:
+  `load`) are retried freely after a rebuild — last write wins.
+- Atomic callable values — immediate `set(prop, old => ...)` **and batch
+  `store()` carrying callables** (see [Subject batch API](subject-batch-atomic.md))
+  — run under `WATCH/MULTI/EXEC` and are non-idempotent by design, so an
+  automatic retry must never risk re-applying the callable. The attempt tracks
+  whether `EXEC` was dispatched:
   - Failure **before** `EXEC` (WATCH/HGET/MULTI/HSET error or timeout) → nothing
     could have committed → safe transparent retry once (covers the stale/dead
     cached-client case).

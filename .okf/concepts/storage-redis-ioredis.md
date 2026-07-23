@@ -4,7 +4,7 @@ title: RedisStorage (ioredis backend)
 description: ioredis-backed Redis storage for KRules subjects, driven by a caller-injected client that the caller owns.
 resource: krules/storage/redis
 tags: [storage, redis, ioredis]
-timestamp: 2026-07-11T09:30:00Z
+timestamp: 2026-07-23T00:00:00Z
 ---
 
 # Overview
@@ -43,9 +43,13 @@ not create, and ioredis already provides the guarantee natively.
 
 # Atomicity
 
-Callable values use ioredis pipelines/`multi()` with `WATCH/MULTI/EXEC` optimistic
+Callable values use ioredis `multi()` with `WATCH/MULTI/EXEC` optimistic
 locking, retrying on `WATCH` conflicts — the same semantics as the Bun-native
-backend, expressed with the ioredis API.
+backend, expressed with the ioredis API. This covers both immediate
+`set(prop, old => ...)` and **batch `store()` carrying callables**: since 0.6.0
+the batch path resolves callables under the same `WATCH/MULTI/EXEC` loop rather
+than against an unlocked snapshot, so batch read-modify-write is atomic against
+concurrent writers. See [Subject batch API](subject-batch-atomic.md).
 
 # Citations
 
