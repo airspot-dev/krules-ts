@@ -15,7 +15,8 @@
  * - Not shared between worker threads (isolated memory)
  */
 
-import type { Storage, StorageChanges, SetResult, DeleteResult, StorageFactory } from './types'
+import type { Storage, StorageChanges, StoreResult, SetResult, DeleteResult, StorageFactory } from './types'
+import { applyChanges } from './apply-changes'
 
 /**
  * Global storage for all subjects.
@@ -109,23 +110,29 @@ export class InMemoryStorage implements Storage {
     return result
   }
 
-  async store(changes: StorageChanges): Promise<void> {
+  async store(changes: StorageChanges): Promise<StoreResult> {
     const store = this.getStore()
 
-    // Apply inserts
-    for (const [property, value] of changes.inserts) {
-      store.set(property, value)
+    // Build a snapshot of the referenced properties. InMemoryStorage runs on a
+    // single event loop, so no lock is needed — resolution is race-free.
+    const current: Record<string, unknown> = {}
+    for (const [property] of changes.sets) {
+      if (store.has(property)) current[property] = store.get(property)
+    }
+    for (const property of changes.deletes) {
+      if (store.has(property)) current[property] = store.get(property)
     }
 
-    // Apply updates
-    for (const [property, value] of changes.updates) {
-      store.set(property, value)
-    }
+    const { newProperties, result } = applyChanges(current, changes)
 
-    // Apply deletes
+    for (const [property] of changes.sets) {
+      store.set(property, newProperties[property])
+    }
     for (const property of changes.deletes) {
       store.delete(property)
     }
+
+    return result
   }
 
   // ============================================

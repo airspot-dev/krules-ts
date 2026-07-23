@@ -14,11 +14,13 @@
  * const container = createKRulesContainer({ storageFactory })
  */
 
-import type { Storage, StorageChanges, SetResult, DeleteResult, StorageFactory } from './types'
+import type { Storage, StorageChanges, StoreResult, SetResult, DeleteResult, StorageFactory } from './types'
+import { applyChanges } from './apply-changes'
 
 // ioredis types - imported dynamically to keep it optional
 type RedisClient = {
   hget(key: string, field: string): Promise<string | null>
+  hmget(key: string, ...fields: string[]): Promise<(string | null)[]>
   hset(key: string, field: string, value: string): Promise<number>
   hset(key: string, map: Record<string, string>): Promise<number>
   hdel(key: string, ...fields: string[]): Promise<number>
@@ -201,34 +203,63 @@ export class RedisStorage implements Storage {
     return result
   }
 
-  async store(changes: StorageChanges): Promise<void> {
-    const pipeline = this.client.multi()
-
-    // Collect all sets
-    const toSet: Record<string, string> = {}
-
-    for (const [property, value] of changes.inserts) {
-      toSet[property] = JSON.stringify(value)
+  async store(changes: StorageChanges): Promise<StoreResult> {
+    if (changes.sets.length === 0 && changes.deletes.length === 0) {
+      return { changed: [], deleted: [] }
     }
 
-    for (const [property, value] of changes.updates) {
-      toSet[property] = JSON.stringify(value)
+    // Callables in a batch make the write non-idempotent, so it must be
+    // serialized with WATCH/MULTI/EXEC and retried on conflict (WatchError).
+    const maxRetries = 10
+    let retries = 0
+
+    while (retries < maxRetries) {
+      try {
+        await this.client.watch(this.hashKey)
+
+        // Read only the properties referenced by this batch.
+        const referenced = [
+          ...new Set([...changes.sets.map(([p]) => p), ...changes.deletes]),
+        ]
+        const current: Record<string, unknown> = {}
+        if (referenced.length > 0) {
+          const raw = await this.client.hmget(this.hashKey, ...referenced)
+          referenced.forEach((property, i) => {
+            const value = raw[i]
+            if (value != null) current[property] = JSON.parse(value)
+          })
+        }
+
+        const { newProperties, result } = applyChanges(current, changes)
+
+        const pipeline = this.client.multi()
+        const toSet: Record<string, string> = {}
+        for (const [property] of changes.sets) {
+          toSet[property] = JSON.stringify(newProperties[property])
+        }
+        if (Object.keys(toSet).length > 0) {
+          pipeline.hset(this.hashKey, toSet)
+        }
+        if (changes.deletes.length > 0) {
+          pipeline.hdel(this.hashKey, ...changes.deletes)
+        }
+
+        const results = await pipeline.exec()
+
+        // null => another client modified the watched key (WatchError), retry.
+        if (results === null) {
+          retries++
+          continue
+        }
+
+        return result
+      } catch (error) {
+        await this.client.unwatch()
+        throw error
+      }
     }
 
-    // Apply sets in batch
-    if (Object.keys(toSet).length > 0) {
-      pipeline.hset(this.hashKey, toSet)
-    }
-
-    // Apply deletes
-    if (changes.deletes.length > 0) {
-      pipeline.hdel(this.hashKey, ...changes.deletes)
-    }
-
-    const results = await pipeline.exec()
-    if (!results) {
-      throw new Error('Redis batch store failed')
-    }
+    throw new Error(`Redis batch store failed after ${maxRetries} retries`)
   }
 
   // ============================================

@@ -35,7 +35,8 @@
  * const container = createKRulesContainer({ storageFactory })
  */
 
-import type { Storage, StorageChanges, SetResult, DeleteResult, StorageFactory } from './types'
+import type { Storage, StorageChanges, StoreResult, SetResult, DeleteResult, StorageFactory } from './types'
+import { applyChanges } from './apply-changes'
 
 // Bun's native Redis client type
 type BunRedisClient = {
@@ -448,41 +449,103 @@ export class BunRedisStorage implements Storage {
     })
   }
 
-  async store(changes: StorageChanges): Promise<void> {
-    // HSET/HDEL are idempotent, so retrying the whole transaction is safe.
-    return this.run(async (client) => {
-      // Start transaction for atomicity
+  async store(changes: StorageChanges): Promise<StoreResult> {
+    if (changes.sets.length === 0 && changes.deletes.length === 0) {
+      return { changed: [], deleted: [] }
+    }
+
+    // Callables in a batch make the write non-idempotent (their whole purpose
+    // is a race-free read-modify-write), so the batch must be serialized with
+    // WATCH/MULTI/EXEC. Same resilience model as setAtomic: retry only when the
+    // failure provably occurred before EXEC.
+    const maxConflictRetries = 10
+    let conflicts = 0
+    let rebuiltBeforeExec = false
+
+    while (conflicts < maxConflictRetries) {
+      const client = await this.currentClient()
+      const state = { execDispatched: false }
+      try {
+        const outcome = await withTimeout(
+          this.storeAttempt(client, changes, state),
+          this.operationTimeoutMs,
+        )
+        if (outcome === 'conflict') {
+          conflicts++
+          continue
+        }
+        return outcome
+      } catch (err) {
+        if (this.injectedClient === null) await evictIfCurrent(this.url!, client)
+
+        const recoverable = isTimeoutError(err) || isConnectionError(err)
+        const provablyNotCommitted = !state.execDispatched
+
+        if (this.injectedClient === null && recoverable && provablyNotCommitted && !rebuiltBeforeExec) {
+          rebuiltBeforeExec = true
+          continue
+        }
+        throw err
+      }
+    }
+
+    throw new Error(`Redis batch store failed after ${maxConflictRetries} retries`)
+  }
+
+  /**
+   * A single WATCH/MULTI/EXEC attempt for a batch store. Reads the referenced
+   * fields under WATCH, resolves callables, queues HSET/HDEL, then EXECs.
+   * Returns 'conflict' if another client modified the key first.
+   */
+  private async storeAttempt(
+    client: BunRedisClient,
+    changes: StorageChanges,
+    state: { execDispatched: boolean }
+  ): Promise<StoreResult | 'conflict'> {
+    await client.send('WATCH', [this.hashKey])
+
+    try {
+      // Read only the properties referenced by this batch.
+      const referenced = [
+        ...new Set([...changes.sets.map(([p]) => p), ...changes.deletes]),
+      ]
+      const current: Record<string, unknown> = {}
+      if (referenced.length > 0) {
+        const raw = (await client.send('HMGET', [this.hashKey, ...referenced])) as (string | null)[]
+        referenced.forEach((property, i) => {
+          const value = raw[i]
+          if (value != null) current[property] = JSON.parse(value)
+        })
+      }
+
+      const { newProperties, result } = applyChanges(current, changes)
+
       await client.send('MULTI', [])
 
-      try {
-        // Collect all sets
-        const toSet: string[] = []
-
-        for (const [property, value] of changes.inserts) {
-          toSet.push(property, JSON.stringify(value))
-        }
-
-        for (const [property, value] of changes.updates) {
-          toSet.push(property, JSON.stringify(value))
-        }
-
-        // Apply sets in batch
-        if (toSet.length > 0) {
-          await client.send('HSET', [this.hashKey, ...toSet])
-        }
-
-        // Apply deletes
-        if (changes.deletes.length > 0) {
-          await client.send('HDEL', [this.hashKey, ...changes.deletes])
-        }
-
-        // Execute transaction
-        await client.send('EXEC', [])
-      } catch (error) {
-        await client.send('DISCARD', []).catch(() => {})
-        throw error
+      const toSet: string[] = []
+      for (const [property] of changes.sets) {
+        toSet.push(property, JSON.stringify(newProperties[property]))
       }
-    })
+      if (toSet.length > 0) {
+        await client.send('HSET', [this.hashKey, ...toSet])
+      }
+      if (changes.deletes.length > 0) {
+        await client.send('HDEL', [this.hashKey, ...changes.deletes])
+      }
+
+      state.execDispatched = true
+      const execResult = await client.send('EXEC', [])
+
+      // null EXEC => another client modified the watched key (provably aborted).
+      if (execResult === null) {
+        return 'conflict'
+      }
+
+      return result
+    } catch (error) {
+      await client.send('DISCARD', []).catch(() => {})
+      throw error
+    }
   }
 
   // ============================================

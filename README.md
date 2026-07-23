@@ -111,6 +111,19 @@ await user.batch()
   .commit()
 ```
 
+Callable values work inside a batch too, and their read-modify-write is
+**atomic against concurrent writers**: the callback is resolved by the storage
+backend inside the same locked transaction that persists the batch
+(PostgreSQL `SELECT FOR UPDATE`, Redis `WATCH/MULTI/EXEC`), not against an
+earlier snapshot.
+
+```typescript
+await user.batch()
+  .set('visits', (current) => (current || 0) + 1)  // atomic RMW, no lost updates
+  .set('status', 'active')
+  .commit()
+```
+
 ### Cleanup
 
 ```typescript

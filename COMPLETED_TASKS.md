@@ -27,3 +27,19 @@ Make `BunRedisStorage` self-heal across Redis/Valkey outages so long-running ser
 - Documented the resilience in `README.md`, seeded an `.okf/` knowledge bundle covering both Redis backends (Bun-native and ioredis) plus a validation concept, and added the Bun-native backend to the `krules-typescript` skill (previously undocumented).
 - Verified end-to-end against real `redis-server` instances: recovery after kill/restart and long outages, bounded (non-hanging) behaviour under a half-open freeze, and exactly-once atomic semantics (a failed atomic during a freeze is not applied).
 - Bumped package version `0.4.0` → `0.5.0`.
+
+## Atomic batch read-modify-write
+
+**Date:** 2026-07-23
+**Branch:** `feature/caveat-su-batch-api`
+
+Make callable read-modify-write inside `batch().commit()` atomic against concurrent writers. Previously the batch resolved callables against an unlocked snapshot (`load()` took no lock; only `store()` locked at commit), so a concurrent writer landing between the read and the commit caused a lost update. The fix moves callable resolution into the storage backend's locked transaction. Immediate-mode `set(prop, callable)` was already atomic; this brings the batch path in line.
+
+**What was done:**
+- Changed the `Storage` contract in `src/storage/types.ts`: `StorageChanges` from `{ inserts, updates, deletes }` to `{ sets, deletes }` (a `sets` value may be a callable `(old) => new`), and `store()` from `Promise<void>` to `Promise<StoreResult>` (`{ changed, deleted }` — materialized old/new computed under the lock). Breaking only for code implementing a custom `Storage` backend; consumers of the built-in backends just bump the version.
+- Added `src/storage/apply-changes.ts`: shared pure resolver (callable execution, `structuredClone` snapshot of the old value before in-place mutation, change/delete detection) used by every backend for identical semantics.
+- Reworked `src/subject/batch.ts`: removed the unlocked `load()`; passes callables through unresolved; emits one `SubjectPropertyChanged`/`SubjectPropertyDeleted` per property from the locked `store()` result, preserving queue order and the muted / unchanged / missing-delete rules (event API unchanged).
+- Backends: Postgres (Bun `bun-postgres`, node `postgres`) resolve callables inside the existing `SELECT … FOR UPDATE` transaction; Redis (Bun `bun-redis`, node `redis`) batch `store()` now runs a `WATCH/MULTI/EXEC` optimistic loop with retry (was `MULTI/EXEC` with no `WATCH`); in-memory resolves on its single event loop.
+- Updated `README.md` (Batch Operations now documents atomic callable RMW) and synced the `.okf/` bundle (new batch + validation concepts, updated both Redis concepts, refreshed indexes/log; `validate --strict` clean).
+- Verified across all five backends with standalone Bun scripts in the monorepo root (`test-batch-shared.ts` + `test-batch-atomic-*.ts`): 11/11 each, including a concurrency guard (Postgres 8×25=200 over pooled `FOR UPDATE` connections; Redis 4×25=100 over independent `WATCH` clients; memory 4×50=200) with zero lost updates.
+- Bumped package version `0.5.0` → `0.6.0` and published `krules@0.6.0` to npm.
