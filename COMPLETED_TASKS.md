@@ -58,3 +58,22 @@ Fix a regression in the 0.6.0 Redis path found during production rollout: atomic
 - Updated `README.md` (three Redis atomicity references now describe the `EVAL` CAS) and synced the `.okf/` bundle (both Redis concepts, the batch concept's locking table, and the validation concept with a guard-gap note; `validate --strict` clean).
 - Verified locally against real Redis and Postgres: 11/11 on all five backends, including the shared-client Redis guard now closing at 200/200 (the exact scenario that produced 1 before the fix). Fix confirmed in the reported production case.
 - Bumped package version `0.6.0` → `0.6.1` and published `krules@0.6.1` to npm.
+
+## Event chain tracking via originId
+
+**Date:** 2026-07-30
+**Branch:** `feature/introduce-origin-id-for-transparent-event-chain-tracking`
+
+Give every event an `originId` identifying the event *chain* it belongs to — the whole causal sequence triggered, directly or indirectly, by a single originating request — so an implicit `subject-property-changed` fired three handlers deep can be correlated with the request that caused it. The id propagates implicitly: callers never thread it through `emit()`, `set()` or `delete()`. Port of the mechanism already present in the Python framework, aligned in semantics but spelled in TypeScript camelCase.
+
+**What was done:**
+- Added `src/origin.ts`, a leaf module built on `AsyncLocalStorage` (`node:async_hooks`, native in Bun — the runtime equivalent of Python's `contextvars.ContextVar`), with no external dependency. Public API: `getOriginId()`, `withOriginId(value, fn)` (explicit id or auto-generated; the callback receives the resolved id), `generateOriginId()`, and the low-level `enterOriginScope()` / `exitOriginScope()` pair for entry points that cannot wrap their work in a callback.
+- Added `originId: string` to `EventContext` (typed, always populated) and reworked `EventBus.emit()`: it inherits an already-active chain, or opens a fresh root chain wrapping the whole dispatch when none is active. Body extracted into a private `dispatchEvent(originId, …)`.
+- Implicit events inherit with no code of their own — `Subject.set/delete/flush`, `BatchBuilder.commit()` and nested `ctx.emit()` all funnel through `EventBus.emit()`, so `subject.ts` and `batch.ts` were left untouched. `Subject` gains no origin-id surface: the id is ambient, not state, and is independent of `extra`.
+- Exposed the API from the package barrel and as a new `krules/origin` subpath export.
+- Documented in `README.md` (new "Event Chain Tracking" section: propagation guarantee, explicit vs auto-generated id, concurrent isolation, and the manual bridge across transport boundaries the framework does not own) plus `ctx.originId` in the built-in-events reference.
+- Added `src/origin.test.ts` (12 checks): implicit inheritance across nested emits / `Subject.set()` / batch commits, isolation between two interleaved concurrent chains on a shared subject, scope hygiene (no leak, nested restore, low-level pair), and the absence of any origin-id member on `Subject`. Whole suite green at 39/39 with `tsc --noEmit` clean.
+- Synced the `.okf/` bundle: new component and validation concepts, refreshed indexes and log; `validate --strict` clean.
+- Bumped package version `0.6.1` → `0.7.0` (additive, backward compatible).
+
+Known limit, documented rather than papered over: `AsyncLocalStorage` follows the async flow of one process, so propagation is automatic only there. Across brokers, schedulers or HTTP hops the id must be carried as data and re-seeded with `withOriginId()` — this package ships no CloudEvents layer to wire it automatically, unlike the Python framework.

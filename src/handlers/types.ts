@@ -31,6 +31,18 @@ export interface EventContext<TPayload = unknown> {
   readonly extra: Record<string, unknown>
 
   /**
+   * Identifier of the event chain this event belongs to.
+   *
+   * Propagates implicitly to every downstream event — those emitted via
+   * `ctx.emit()` as well as the implicit ones from `Subject.set()`,
+   * `Subject.delete()`, `Subject.flush()` and batch commits. Always populated:
+   * an event emitted outside any chain opens a new one with a generated id.
+   *
+   * See `withOriginId()` / `getOriginId()` in `krules/origin`.
+   */
+  readonly originId: string
+
+  /**
    * Emit a new event from within a handler.
    * Uses the same EventBus instance.
    */

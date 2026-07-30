@@ -9,6 +9,7 @@
 - **Storage Routing**: Dynamically route subjects to different backends based on their names (e.g., `user:*` → Redis, `device:*` → PostgreSQL).
 - **Reactive Rules**: Fluent API for defining rules and side effects based on state changes (`on(...).when(...).run(...)`).
 - **Custom Events**: Emit and handle domain-specific events, enabling event-driven architectures and handler chaining.
+- **Event Chain Tracking**: Every event carries an `originId` that propagates implicitly across the whole causal chain it belongs to, with no manual threading.
 - **Advanced PostgreSQL Support**: Leverages JSONB and generated columns for high-performance querying and flexible indexing.
 
 ## Installation
@@ -150,8 +151,11 @@ on(SubjectPropertyChanged)
     ctx.oldValue       // Previous value (undefined if new)
     ctx.newValue       // New value
     ctx.extra          // Extra context passed via set(..., { extra })
+    ctx.originId       // Id of the event chain this event belongs to
   })
 ```
+
+> `ctx.originId` is available on **every** event, built-in or custom — see [Event Chain Tracking](#event-chain-tracking-originid).
 
 ### SubjectPropertyDeleted
 
@@ -279,6 +283,70 @@ on('device.?').run(...)         // matches device.1, device.A, but not device.10
 // Multiple patterns (OR logic)
 on('user.login', 'user.logout').run(...)  // matches either event
 ```
+
+### Event Chain Tracking (`originId`)
+
+Every event carries an **`originId`**: the identifier of the *event chain* it belongs to — the whole causal sequence of events triggered, directly or indirectly, by a single originating request. It lets you correlate, in logs or downstream systems, an implicit `subject-property-changed` fired three handlers deep with the HTTP request that ultimately caused it.
+
+The guarantee is **implicit propagation**: you never thread the id through `emit()`, `set()` or `delete()`. Any event emitted while a chain is active inherits its id — explicit `ctx.emit()` calls as well as the implicit events from `Subject.set()`, `Subject.delete()`, `Subject.flush()` and batch commits.
+
+```typescript
+import { withOriginId, getOriginId } from 'krules'
+
+on('order.received').run(async (ctx) => {
+  console.log(ctx.originId)              // "REQ-abc"
+  await ctx.subject.set('status', 'paid') // implicit event, same originId
+  await ctx.emit('order.confirmed', ctx.subject)
+})
+
+on('subject-property-changed').run(async (ctx) => {
+  console.log(ctx.originId)              // "REQ-abc" — inherited, nothing threaded
+})
+
+// Entry point: seed the chain with an id taken from the incoming request
+await withOriginId(request.headers.get('x-request-id'), async () => {
+  await emit('order.received', container.subject('order:42'), body)
+})
+```
+
+Passing `undefined` lets the framework generate one; the callback receives the resolved id:
+
+```typescript
+await withOriginId(undefined, async (originId) => {
+  response.headers.set('x-origin-id', originId)
+  await emit('order.received', order, body)
+})
+```
+
+You do not have to open a chain at all: an event emitted outside any chain **opens a fresh root chain** with a generated id, which everything emitted during its dispatch inherits. So `ctx.originId` is always populated.
+
+Concurrent chains are **fully isolated**. Propagation is built on `AsyncLocalStorage`, so the id follows the async flow and never leaks between chains running in parallel:
+
+```typescript
+await Promise.all([
+  withOriginId('REQ-1', () => emit('order.received', orderA, bodyA)),
+  withOriginId('REQ-2', () => emit('order.received', orderB, bodyB)),
+])
+// Handlers triggered by the first chain see REQ-1, the second REQ-2. No cross-talk.
+```
+
+**Crossing transport boundaries.** `AsyncLocalStorage` follows the async flow of one process; it cannot follow a message through a broker, a scheduler, or an HTTP hop. On those boundaries the id travels **as data** and gets re-seeded on the way in — `getOriginId()` and `withOriginId()` are exactly that bridge:
+
+```typescript
+// Outbound: read the current chain and carry it in the message
+await broker.publish('orders', { ...payload, originId: getOriginId() })
+
+// Inbound: re-seed the chain before dispatching locally, so it continues seamlessly
+await withOriginId(message.originId, async () => {
+  await emit('order.received', container.subject(message.subject), message.payload)
+})
+```
+
+For entry points that cannot wrap their work in a callback, a low-level pair is available: `enterOriginScope(value?)` binds an id to the current flow and returns it, `exitOriginScope()` detaches it. Prefer `withOriginId()`, which cannot leak the scope.
+
+> `originId` belongs to the event chain, not to state: the `Subject` neither stores nor exposes it. It is also independent of `extra`, which keeps its per-call user-metadata semantics.
+>
+> The same concept exists in Python KRules under `origin_id`, and maps to the `originid` CloudEvent extension attribute on the wire. This package uses the TypeScript camelCase spelling; the semantics are identical.
 
 ### Middleware
 
