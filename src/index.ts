@@ -56,6 +56,15 @@ export {
 // EventBus
 export { EventBus } from './event-bus'
 
+// Event-chain tracking (also available via 'krules/origin')
+export {
+  getOriginId,
+  withOriginId,
+  generateOriginId,
+  enterOriginScope,
+  exitOriginScope,
+} from './origin'
+
 // Subject
 export { Subject, type SetOptions, type DeleteOptions } from './subject/subject'
 export { BatchBuilder } from './subject/batch'

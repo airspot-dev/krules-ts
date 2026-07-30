@@ -1,5 +1,10 @@
 # Update Log
 
+## 2026-07-30
+* **Feature (0.7.0)**: event-chain tracking. Every event now carries `ctx.originId`, the identifier of the causal chain it belongs to, propagated implicitly via `AsyncLocalStorage` — nested `ctx.emit()`, `Subject.set/delete/flush` and batch commits all inherit it with no manual threading. New leaf module `krules/origin` (`getOriginId`, `withOriginId`, `generateOriginId`, `enterOriginScope`/`exitOriginScope`), also exposed as the `krules/origin` subpath. Port of the Python `origin_id` mechanism, aligned conceptually but using TypeScript camelCase.
+  * **Creation**: [Event chain tracking (originId)](concepts/event-chain-origin-id.md) — propagation model, public API, the transport-boundary bridge (no CloudEvents layer in this package), and the cross-framework naming rationale.
+  * **Creation**: [Validation: origin id propagation](concepts/validation-origin-id-propagation.md) — 12 checks covering implicit inheritance, concurrent isolation, scope hygiene and the absence of any origin-id surface on `Subject`.
+
 ## 2026-07-23
 * **Fix (0.6.1)**: Redis atomic read-modify-write moved from `WATCH/MULTI/EXEC` to a server-side compare-and-set Lua script (`EVAL`). The `WATCH/MULTI/EXEC` state is per-connection, and both Redis backends use a *shared* connection, so concurrent writers on one socket interleaved and isolation collapsed (N concurrent `+1` → final value 1). New shared logic in `krules/storage/redis-cas`.
   * **Update**: [RedisStorage (ioredis)](concepts/storage-redis-ioredis.md) and [BunRedisStorage (Bun native)](concepts/storage-bun-redis.md) — Atomicity/Retry-safety rewritten for the CAS (`EVAL`) mechanism; added `atomicMaxRetries` (default 100) with jittered-backoff retry.

@@ -1,5 +1,9 @@
 # Concepts
 
+# Events
+
+* [Event chain tracking (originId)](event-chain-origin-id.md) - ambient chain identifier propagated implicitly via AsyncLocalStorage, with getter + scope as the bridge across transport boundaries.
+
 # Subject
 
 * [Subject batch API (atomic RMW)](subject-batch-atomic.md) - batch() + the Storage.store() contract that resolves callables under the backend lock.
@@ -13,3 +17,4 @@
 
 * [BunRedisStorage reconnection](validation-bun-redis-reconnection.md) - Empirical recovery validation across outage and half-open freeze scenarios.
 * [Batch atomic RMW](validation-batch-atomic-rmw.md) - Cross-backend verification that batch callable RMW is atomic with no lost updates.
+* [Origin id propagation](validation-origin-id-propagation.md) - Implicit inheritance across nested emits, Subject mutations and batch commits; isolation between concurrent chains.

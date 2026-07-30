@@ -9,6 +9,7 @@
  */
 
 import type { Subject } from './subject/subject'
+import { getOriginId, withOriginId } from './origin'
 import type {
   EventContext,
   HandlerFunction,
@@ -28,6 +29,7 @@ class EventContextImpl implements EventContext {
     public readonly subject: Subject,
     public readonly payload: unknown,
     public readonly extra: Record<string, unknown>,
+    public readonly originId: string,
     private readonly eventBus: EventBus,
     public readonly propertyName?: string,
     public readonly oldValue?: unknown,
@@ -156,6 +158,13 @@ export class EventBus {
   /**
    * Emit an event to all matching handlers.
    *
+   * Event-chain tracking: if an origin id is already bound to the current async
+   * flow, this event joins that chain and inherits it. Otherwise the event opens
+   * a fresh root chain with a generated id, which every event emitted during its
+   * dispatch — nested `ctx.emit()` calls and the implicit events from
+   * `Subject.set()` / `delete()` / `flush()` — inherits automatically. Callers who
+   * need an explicit id wrap the entry point in `withOriginId()`.
+   *
    * @param eventType - The event type string
    * @param subject - The subject associated with this event
    * @param payload - Optional event payload
@@ -174,11 +183,48 @@ export class EventBus {
       errorMode?: ErrorMode
     }
   ): Promise<void> {
+    const activeOriginId = getOriginId()
+
+    if (activeOriginId !== undefined) {
+      await this.dispatchEvent(
+        activeOriginId,
+        eventType,
+        subject,
+        payload,
+        extra,
+        options
+      )
+      return
+    }
+
+    await withOriginId(undefined, (originId) =>
+      this.dispatchEvent(originId, eventType, subject, payload, extra, options)
+    )
+  }
+
+  /**
+   * Build the context and run the middleware + handler chain for one event,
+   * within an already-resolved event chain.
+   */
+  private async dispatchEvent(
+    originId: string,
+    eventType: string,
+    subject: Subject,
+    payload?: unknown,
+    extra?: Record<string, unknown>,
+    options?: {
+      propertyName?: string
+      oldValue?: unknown
+      newValue?: unknown
+      errorMode?: ErrorMode
+    }
+  ): Promise<void> {
     const ctx = new EventContextImpl(
       eventType,
       subject,
       payload ?? {},
       extra ?? {},
+      originId,
       this,
       options?.propertyName,
       options?.oldValue,
