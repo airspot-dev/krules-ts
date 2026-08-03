@@ -77,3 +77,27 @@ Give every event an `originId` identifying the event *chain* it belongs to — t
 - Bumped package version `0.6.1` → `0.7.0` (additive, backward compatible).
 
 Known limit, documented rather than papered over: `AsyncLocalStorage` follows the async flow of one process, so propagation is automatic only there. Across brokers, schedulers or HTTP hops the id must be carried as data and re-seeded with `withOriginId()` — this package ships no CloudEvents layer to wire it automatically, unlike the Python framework.
+
+## The krules-typescript skill mounted as a production submodule
+
+**Date:** 2026-08-03
+
+This repository produces the `krules-typescript` skill, which until now lived in an
+unrelated monorepo with nothing connecting the two. It is now mounted at
+`.claude/skills/krules-typescript` from `krules-typescript-skill`, and a new `CLAUDE.md`
+carries the rule that keeps the two in step.
+
+**Why it was needed.** The skill had drifted two releases behind: it still described Redis
+atomicity as `WATCH/MULTI/EXEC`, the mechanism replaced in 0.6.1 precisely because its
+per-connection state silently lost concurrent writes on a shared connection, and it did not
+mention `originId` at all. Both were fixed from this repository's own knowledge bundle
+before the link was made.
+
+**The signal is checkable rather than discretionary.** The skill declares a package version
+that must match `package.json`, and `.okf/log.md` records behavioural changes entry by
+entry. A release that moves the version without touching the skill is a verifiable
+mismatch.
+
+**`CLAUDE.md` is written for a public repository from the start:** project identity,
+layout, the pointer to the knowledge bundle, and the co-evolution rule. No internal
+workspace configuration, no local paths, no references to private aggregators.

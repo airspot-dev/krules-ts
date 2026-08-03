@@ -1,0 +1,4 @@
+[submodule ".claude/skills/krules-typescript"]
+	path = .claude/skills/krules-typescript
+	url = git@github.com:airspot-dev/krules-typescript-skill.git
+	branch = main
